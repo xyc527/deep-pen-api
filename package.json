@@ -1,0 +1,30 @@
+{
+  "name": "deep-pen-api",
+  "version": "0.1.7",
+  "private": true,
+  "description": "DeepSeek 客户端（词典笔 / Falcon 小程序，纯 API 端点模式）",
+  "appid": "8000000000182399",
+  "appName": "DeepSeek",
+  "icon": "app_icon.png",
+  "quickjs": {
+    "version": "20200705",
+    "bigNum": false
+  },
+  "single-js-bundle": false,
+  "scripts": {
+    "build": "node scripts/build.js",
+    "build:prod": "node scripts/build.js prod",
+    "bump": "node scripts/bump.js",
+    "test": "node test/run.mjs"
+  },
+  "devDependencies": {
+    "@rollup/plugin-typescript": "^12.1.3",
+    "@vue/compiler-sfc": "^3.5.17",
+    "aiot-vue-cli": "1.0.32",
+    "typescript": "^5.6.0",
+    "vue": "^3.5.17"
+  },
+  "dependencies": {
+    "falcon-ui": "^0.0.17"
+  }
+}

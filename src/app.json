@@ -1,0 +1,8 @@
+{
+  "pages": {
+    "index": "pages/index/index.vue",
+    "setup": "pages/setup/setup.vue",
+    "settings": "pages/settings/settings.vue",
+    "latexlab": "pages/latexlab/latexlab.vue"
+  }
+}
