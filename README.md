@@ -142,7 +142,7 @@ Falcon 运行时同源；`falcon-ui` 是其配套 UI 包。两者在 npm 上公�
   主要以它为依据；本项目**只参考其中的平台事实与接口清单，未复制文档正文**，也未随仓库分发。
   本项目里"`<text>` 不能有元素子节点""固件内置 LaTeX 字号固定 34px""从子页面返回不触发 `onShow`"
   这类结论，是在该文档基础上到真机上逐条实测确认的；**文档与固件实际行为不一致时以实测为准**
-  （本项目的 `CHANGELOG` 与源码注释里记了多处这类差异）。
+  （差异见下文「已知限制」与源码里的实测注释）。
 - **[haasui-falcon-app](https://github.com/Magniswan/haasui-falcon-app)**：词典笔 Falcon 小程序
   开发参考。`src/services/ime.js` 的输入法接入路径（`global.startTextEdit` +
   `textEditFinished` 双通道回传）参考其输入法章节，以及 `templates/jsapi` 里
