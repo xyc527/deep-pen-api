@@ -1,6 +1,6 @@
 # deep-pen-api
 
-运行在有道词典笔上的 **DeepSeek 客户端**，Falcon 小程序框架（HaaS UI）。
+运行在词典笔上的 **DeepSeek 客户端**，Falcon 小程序框架（HaaS UI）。
 
 不走任何第三方反代，直连 `api.deepseek.com` 官方端点，用你自己的 API Key。
 
@@ -135,9 +135,9 @@ Falcon 运行时同源；`falcon-ui` 是其配套 UI 包。两者在 npm 上公�
 
 ### 3. 平台知识来源
 
-- **HaaS UI（有道词典笔 OS）开发文档** —— [docs.posc.net](https://docs.posc.net)，
-  由社区 **PenOSCrack（POSC）** 维护整理，**不是有道官方发布的文档**
-  （该文档自述"由杭八识文档改编，深度化适配网易有道词典笔 OS"）。
+- **HaaS UI（词典笔 OS）开发文档** —— [docs.posc.net](https://docs.posc.net)，
+  由社区 **PenOSCrack（POSC）** 维护整理，**不是厂商发布的文档**
+  （该文档自述由社区据既有资料改编、深度适配词典笔 OS）。
   页面注册、生命周期、JSAPI 清单、真机安装/启动指令、PStore 授权与签名校验等平台事实，
   主要以它为依据；本项目**只参考其中的平台事实与接口清单，未复制文档正文**，也未随仓库分发。
   本项目里"`<text>` 不能有元素子节点""固件内置 LaTeX 字号固定 34px""从子页面返回不触发 `onShow`"
@@ -168,7 +168,7 @@ Falcon 运行时同源；`falcon-ui` 是其配套 UI 包。两者在 npm 上公�
 
 ## 鸣谢
 
-- **有道 / HaaS UI 团队**：提供词典笔上的 Falcon 小程序运行时与 SDK（宿主固件侧）
+- **HaaS UI 运行时的维护方**：提供词典笔上的 Falcon 小程序运行时与 SDK（宿主固件侧）
 - **PenOSCrack（POSC）社区**：维护 docs.posc.net 上那套 HaaS UI 开发文档。这类封闭小设备上
   几乎没有官方公开的完整资料，这套社区文档是外部开发者入门的主要入口
 - **`aiot-vue-cli` 与 `falcon-ui` 的作者**：构建链与控件基础，没有它们这个项目得从手工拼 amr 开始
@@ -189,7 +189,7 @@ Falcon 运行时同源；`falcon-ui` 是其配套 UI 包。两者在 npm 上公�
 
 ## 声明
 
-非官方项目，与 DeepSeek、有道均无关联。"DeepSeek"、"有道"、"词典笔"等名称与商标
+非官方项目，与 DeepSeek 及本项目所运行设备的厂商均无关联。"DeepSeek"、"词典笔"等名称与商标
 归各自权利人所有，此处仅作兼容性说明之用。使用需自备 API Key，费用自理。
 
 本仓库**只包含代码**：不含任何人的 API Key、不含节假日原始数据、不含平台开发文档或其副本
