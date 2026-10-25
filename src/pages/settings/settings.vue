@@ -2,7 +2,15 @@
     <div class="st-page">
         <div class="st-top">
             <text class="st-title">设置</text>
-            <text class="st-sub">{{ connLabel }}</text>
+            <text :class="topHintClass">{{ topHint }}</text>
+            <!-- 保存方式：自动=改一项存一项；手动=只在点「保存」时落盘。
+                 两者互斥 —— 自动模式下这一区域不会出现保存按钮。 -->
+            <div class="st-mode" @click="toggleSaveMode">
+                <text class="st-modetxt">保存：{{ isAutoSave ? '自动' : '手动' }}</text>
+            </div>
+            <div v-if="!isAutoSave" :class="saveBtnClass" @click="saveNow">
+                <text :class="saveBtnTxtClass">{{ saveBtnLabel }}</text>
+            </div>
             <div class="st-btn" @click="back"><text class="st-btntxt">返回</text></div>
         </div>
 
@@ -138,21 +146,22 @@ import { openTextEditor } from '../../services/ime.js'
 import { navTo, deviceInfo, log } from '../../services/platform.js'
 import { listModels, testConnection, fetchBalance } from '../../services/api.js'
 import { PARAMS, PARAM_MAP, defaultParams, clampNumber, buildBody, describeBody, modelOptions } from '../../lib/params.js'
-import { maskKey, normalizeBaseUrl, isReady } from '../../lib/settings.js'
+import { maskKey, normalizeBaseUrl, isReady, settingsSignature } from '../../lib/settings.js'
 import { describePeriod, setTimeSkew, nowMs, formatRemain, holidayTableYears } from '../../lib/peak.js'
 import { restoreHoliday, ensureHoliday, holidaySummary } from '../../services/holiday.js'
 import { balanceDetailText, balanceLevel, balanceSplitText, updatedAgo } from '../../lib/balance.js'
 import { CAMERA_APPS } from '../../services/media.js'
-import { setUiState } from '../../lib/uistate.js'
+import { setUiState, publishSettings } from '../../lib/uistate.js'
 
 const GROUP_TITLES = {
     core: '模型与思考',
+    web: '联网搜索',
     sampling: '采样与长度',
     output: '输出与结构',
     experimental: '实验特性'
 }
 
-const GROUP_ORDER = ['core', 'sampling', 'output', 'experimental']
+const GROUP_ORDER = ['core', 'web', 'sampling', 'output', 'experimental']
 
 export default {
     name: 'settings',
@@ -172,7 +181,13 @@ export default {
             // 节假日数据
             holBusy: false,
             holMsg: '',
-            holInfo: null
+            holInfo: null,
+            // 保存：saveMsg 是顶栏那行状态；savedSig 是"磁盘上那份"的指纹，
+            // 和当前设置一比对就知道有没有未保存改动（手动模式才有意义）
+            saveMsg: '',
+            savedSig: '',
+            dirty: false,
+            leaveWarn: false
         }
     },
     computed: {
@@ -190,6 +205,30 @@ export default {
         connLabel() {
             const n = this.settings && this.settings.models ? this.settings.models.length : 0
             return n ? '已扫描 ' + n + ' 个可用模型' : '参数项与可选值对齐 DeepSeek 官方文档'
+        },
+        // ---------- 保存 ----------
+        isAutoSave() {
+            return !this.settings || this.settings.saveMode !== 'manual'
+        },
+        saveBtnLabel() {
+            return this.dirty ? '保存' : '已保存'
+        },
+        saveBtnClass() {
+            return this.dirty ? 'st-save-on' : 'st-save-off'
+        },
+        saveBtnTxtClass() {
+            return this.dirty ? 'st-savetxt-on' : 'st-savetxt-off'
+        },
+        // 顶栏那行字：优先报保存状态，其次提示有未保存改动，最后才是常规说明
+        topHint() {
+            if (this.saveMsg) return this.saveMsg
+            if (!this.isAutoSave && this.dirty) return '有改动未保存'
+            return this.connLabel
+        },
+        topHintClass() {
+            if (this.saveMsg && this.saveMsg.indexOf('失败') >= 0) return 'st-sub-bad'
+            if (this.leaveWarn || (!this.isAutoSave && this.dirty)) return 'st-sub-warn'
+            return 'st-sub'
         },
         connStatusClass() {
             return this.connOk ? 'st-ok' : 'st-hint'
@@ -337,8 +376,13 @@ export default {
     methods: {
         async load() {
             this.settings = await loadSettings()
-            // 把落盘的真实值广播一次，防止首页拿着旧值（比如先开首页再进设置）
+            // 记下"磁盘上那份"的指纹，手动保存模式用它判断有没有未保存改动
+            this.savedSig = settingsSignature(this.settings)
+            this.dirty = false
+            // 把落盘的真实值广播一次：首页可能拿着旧值（先开首页再进设置），
+            // 而返回上一页时固件不触发首页 onShow，只能靠这条通道
             setUiState({ showBalance: this.settings.showBalance !== false })
+            publishSettings(this.settings)
             const dev = deviceInfo()
             if (dev.model) log('settings ' + dev.model + ' ' + dev.version + ' ' + dev.width + 'x' + dev.height)
             // 先贴上次的余额 + 时钟偏差（断网也有东西看），再起倒计时、查新的
@@ -390,11 +434,8 @@ export default {
         // 直接改写的派发不稳，换引用才能保证 computed 一定重算
         toggleShowBalance() {
             const next = !this.showBalOn
-            this.settings = Object.assign({}, this.settings, { showBalance: next })
-            this.persist()
-            // 广播给首页：返回上一页时固件不触发首页 onShow，只能主动推过去，
-            // 否则会"点了隐藏，回首页芯片还在"
-            setUiState({ showBalance: next })
+            // 广播交给 persist()：手动保存模式下，开关改动要等点「保存」才对首页生效
+            this.apply({ showBalance: next })
             log('showBalance ' + next)
         },
 
@@ -448,26 +489,107 @@ export default {
                 this.tickTimer = null
             }
         },
+        // ---------- 保存 ----------
+        // 所有改动都走这里：整体换对象（不就地改字段），再按保存模式决定落盘还是标记待存。
+        // 统一入口的好处是"手动模式"只需要在一个地方判断，不会漏掉某个开关。
+        apply(patch) {
+            if (!this.settings) return false
+            this.settings = Object.assign({}, this.settings, patch || {})
+            if (this.isAutoSave) {
+                this.persist()
+            } else {
+                // 一有改动就让位给「有改动未保存」，别让上一条提示一直占着顶栏
+                this.saveMsg = ''
+                this.refreshDirty()
+            }
+            return true
+        },
+        afterChange() {
+            if (this.isAutoSave) this.persist()
+            else this.refreshDirty()
+        },
+        refreshDirty() {
+            if (!this.savedSig) { this.dirty = false; return }
+            this.dirty = settingsSignature(this.settings) !== this.savedSig
+            if (this.dirty) this.leaveWarn = false
+        },
+        // 落盘 + 回读校验。saveSettings 内部是同步写（本机 fs.writeFile 同步），
+        // 返回 null 表示写失败 —— 以前这个返回值被丢掉，写失败时界面一切正常，
+        // 重启后设置全没了，正是"填了 Key 又消失"那类反馈的来源之一。
         persist() {
-            saveSettings(this.settings)
+            if (!this.settings) return false
+            const saved = saveSettings(this.settings)
+            if (!saved) {
+                this.saveMsg = '保存失败：写入配置失败，请重试'
+                this.refreshDirty()
+                log('saveSettings 返回 null')
+                return false
+            }
+            this.settings = saved
+            this.savedSig = settingsSignature(saved)
+            this.dirty = false
+            this.leaveWarn = false
+            this.saveMsg = '已保存'
+            // 首页靠这条通道换掉自己那份 settings（返回上一页不触发 onShow）
+            publishSettings(saved)
+            return true
+        },
+        saveNow() {
+            if (this.isAutoSave) { this.saveMsg = '当前是自动保存，无需手动保存'; return }
+            if (!this.dirty) { this.saveMsg = '没有需要保存的改动'; return }
+            this.persist()
+        },
+        toggleSaveMode() {
+            const next = this.isAutoSave ? 'manual' : 'auto'
+            // 模式本身立刻落盘（切换动作不能丢），顺带把已有改动一起存了
+            this.settings = Object.assign({}, this.settings, { saveMode: next })
+            const ok = this.persist()
+            if (!ok) return
+            this.saveMsg = next === 'manual'
+                ? '已切到手动保存：改完点右上「保存」'
+                : '已切到自动保存：改动即时落盘'
+            log('saveMode ' + next)
+        },
+        // 保存后回读一遍，确认磁盘上真的是用户输入的值（防"看着存了其实没存"）
+        async verifyKey(expected) {
+            const disk = await loadSettings()
+            if (!disk || disk.apiKey !== expected) {
+                this.saveMsg = '保存失败：磁盘上的 Key 与输入不一致'
+                log('verifyKey 不一致 disk=' + (disk ? disk.apiKey.length : -1) + ' want=' + expected.length)
+                return false
+            }
+            return true
         },
 
         // ---------- 连接 ----------
+        // 注意这里必须先判空：load() 是异步的（要读文件、还要等节假日网络），
+        // 页面一渲染出来就能点。以前直接取 this.settings.apiKey，抢在加载完成前
+        // 点就会抛 TypeError —— async 方法里抛出的错没人接，用户看到的就是
+        // "点了没反应、填了也不保存"，这正是首次进入时的必现路径。
         async editKey() {
+            if (!this.settings) { this.connStatus = '配置还在读取，请稍候再点'; return }
             const text = await openTextEditor(this.settings.apiKey || '', { multiLine: false, confirmText: '确定', maxlength: 200 })
             if (text === null || text === undefined) return
-            this.settings.apiKey = String(text).trim()
-            this.persist()
-            this.connStatus = isReady(this.settings) ? '已保存，建议点「测试连接」验证' : 'Key 太短，仍不可用'
+            const key = String(text).trim()
             this.connOk = false
+            this.apply({ apiKey: key })
+            if (!this.isAutoSave) { this.connStatus = '已修改，点右上「保存」生效'; return }
+            const ok = await this.verifyKey(key)
+            this.connStatus = !ok
+                ? '保存失败，请重试'
+                : (isReady(this.settings) ? '已保存，建议点「测试连接」验证' : 'Key 太短，仍不可用')
         },
         async editBase() {
+            if (!this.settings) { this.connStatus = '配置还在读取，请稍候再点'; return }
             const text = await openTextEditor(this.settings.baseUrl || '', { multiLine: false, confirmText: '确定', maxlength: 200 })
             if (text === null || text === undefined) return
-            this.settings.baseUrl = normalizeBaseUrl(text)
-            this.persist()
-            this.connStatus = '服务地址已改为 ' + this.settings.baseUrl
+            const url = normalizeBaseUrl(text)
             this.connOk = false
+            this.apply({ baseUrl: url })
+            if (!this.isAutoSave) { this.connStatus = '已修改，点右上「保存」生效'; return }
+            const disk = await loadSettings()
+            if (!disk || disk.baseUrl !== url) { this.saveMsg = '保存失败：服务地址未写入'; return }
+            this.connStatus = '服务地址已改为 ' + url
         },
         async test() {
             if (this.scanning) return
@@ -516,16 +638,14 @@ export default {
             // Weex 运行时对"深层属性直接改写"的派发不稳（曾经表现为扫描成功、
             // 界面上的模型选项一个字都没变）；换引用能保证 groups / modelOpts
             // 这两个 computed 一定重算，模板一定重渲染。
-            this.settings = Object.assign({}, this.settings, { models: arr, params: p })
-            this.persist()
+            this.apply({ models: arr, params: p })
         },
 
         // ---------- 参数 ----------
         setParam(key, value) {
             const p = Object.assign({}, this.settings.params)
             p[key] = value
-            this.settings.params = p
-            this.persist()
+            this.apply({ params: p })
         },
         stepParam(it, dir) {
             const def = PARAM_MAP[it.key]
@@ -570,17 +690,16 @@ export default {
             this.setParam(it.key, String(text))
         },
         async editSystem() {
+            if (!this.settings) { this.connStatus = '配置还在读取，请稍候再点'; return }
             const text = await openTextEditor(this.settings.systemPrompt || '', { multiLine: true, confirmText: '完成', maxlength: 1200 })
             if (text === null || text === undefined) return
-            this.settings.systemPrompt = String(text)
-            this.persist()
+            this.apply({ systemPrompt: String(text) })
         },
         stepHistory(dir) {
-            let v = (this.settings.maxHistory || 0) + dir
+            let v = ((this.settings && this.settings.maxHistory) || 0) + dir
             if (v < 0) v = 0
             if (v > 20) v = 20
-            this.settings.maxHistory = v
-            this.persist()
+            this.apply({ maxHistory: v })
         },
         cycleCamera() {
             const cur = this.settings.params.cameraAppid || CAMERA_APPS[0].appid
@@ -590,6 +709,13 @@ export default {
             this.setParam('cameraAppid', next.appid)
         },
         back() {
+            // 手动保存模式下有未保存改动：第一次点只提醒，再点一次才真的丢弃离开。
+            // 不做自动保存 —— 那样"手动"就名不副实了。
+            if (!this.isAutoSave && this.dirty && !this.leaveWarn) {
+                this.leaveWarn = true
+                this.saveMsg = '有未保存改动，再点一次「返回」将放弃'
+                return
+            }
             this.stopTick()
             navTo('index', {})
         }
@@ -624,6 +750,71 @@ export default {
     font-size: 11px;
     color: #6d6d7c;
     flex: 1;
+}
+
+/* 顶栏状态：未保存=琥珀，保存失败=红 */
+.st-sub-warn {
+    font-size: 11px;
+    color: #fbbf24;
+    flex: 1;
+}
+
+.st-sub-bad {
+    font-size: 11px;
+    color: #f87171;
+    flex: 1;
+}
+
+/* 保存方式切换：始终可见，点一下在 自动 / 手动 之间切 */
+.st-mode {
+    flex-direction: row;
+    align-items: center;
+    height: 24px;
+    padding-left: 10px;
+    padding-right: 10px;
+    margin-right: 8px;
+    border-radius: 6px;
+    background-color: #2a2a33;
+    border-width: 1px;
+    border-color: #3a3a46;
+}
+
+.st-modetxt {
+    font-size: 11px;
+    color: #c9c9d4;
+}
+
+/* 手动模式下的保存按钮：有改动才亮，没有改动时是灰的（不可点） */
+.st-save-on {
+    flex-direction: row;
+    align-items: center;
+    height: 24px;
+    padding-left: 12px;
+    padding-right: 12px;
+    margin-right: 8px;
+    border-radius: 6px;
+    background-color: #fbbf24;
+}
+
+.st-savetxt-on {
+    font-size: 12px;
+    color: #201704;
+}
+
+.st-save-off {
+    flex-direction: row;
+    align-items: center;
+    height: 24px;
+    padding-left: 12px;
+    padding-right: 12px;
+    margin-right: 8px;
+    border-radius: 6px;
+    background-color: #2a2a33;
+}
+
+.st-savetxt-off {
+    font-size: 12px;
+    color: #6d6d7c;
 }
 
 /* 可点击元素一律用 div 承载 padding：<text> 的 padding 不进布局与命中测试，

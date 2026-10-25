@@ -4,13 +4,14 @@ import { holdIncompleteTail, stripInternalTags } from '../src/lib/text.js'
 import { splitMath, latexToUnicode, canTypeset, isBalanced, splitMathLines, estimateWidth, needsDisplayMath, looksLikeBareMath, tightenMathSpaces } from '../src/lib/latex.js'
 import { inlineRuns, runsWithMath, parseBlocks, renderPlan, promoteInlineBlocks, needsPaperSheet } from '../src/lib/md.js'
 import { defaultParams, buildBody, describeBody, scopeOf, clampNumber, parseStop, PARAM_MAP, modelOptions } from '../src/lib/params.js'
-import { normalizeSettings, normalizeBaseUrl, maskKey, isReady } from '../src/lib/settings.js'
+import { normalizeSettings, normalizeBaseUrl, maskKey, isReady, settingsSignature, saveButtonState } from '../src/lib/settings.js'
 import { buildApiMessages, newMessage, titleFrom, ensureTitle, trimMessages, summarizeUsage } from '../src/lib/chat.js'
 import { diffNewPhotos, addPhoto, removePhoto, sortByMtimeDesc, isImageName, formatSize } from '../src/lib/photos.js'
 import { billingPeriod, isHoliday, formatRemain, describePeriod, holidayTableYears, setTimeSkew, nowMs, applyHolidayDays, isMakeupWorkday, holidayYearFrom } from '../src/lib/peak.js'
 import { parseHolidayPayload, countHolidayDays, holidaySources } from '../src/lib/holiday.js'
 import { moneyText, normalizeBalance, balanceLevel, balanceChipText, balanceSplitText, updatedAgo } from '../src/lib/balance.js'
-import { getUiState, setUiState, subscribeUiState } from '../src/lib/uistate.js'
+import { getUiState, setUiState, subscribeUiState, publishSettings } from '../src/lib/uistate.js'
+import { normalizeSearchMode, shouldSearch, buildSearchQuery, parseSearchResults, formatSearchContext, searchSources, hostOf, injectSearchContext } from '../src/lib/search.js'
 
 let pass = 0
 let fail = 0
@@ -277,10 +278,11 @@ function eq(a, b, name) {
   b = buildBody(Object.assign({}, p, { userId: 'ok-id_1' }), [{ role: 'user', content: 'hi' }])
   ok(b.ok && b.body.user_id === 'ok-id_1', '合法 user_id 通过')
 
-  // 联网搜索预留
-  b = buildBody(Object.assign({}, p, { webSearch: true }), [{ role: 'user', content: 'hi' }])
-  ok(b.body.web_search_options, '联网搜索预留字段')
-  ok(b.warnings.length > 0, '联网搜索给出实验提示')
+  // 联网搜索：请求体里**不能**再出现 web_search_options（那个字段官方未公开、
+  // 收下也不检索，是上一版的假开关）
+  b = buildBody(Object.assign({}, p, { searchMode: 'always' }), [{ role: 'user', content: 'hi' }])
+  ok(b.body.web_search_options === undefined, '不再发送假的 web_search_options')
+  ok(b.warnings.length === 0, '联网搜索不再产生实验性警告')
 
   // 空消息拒绝
   b = buildBody(p, [])
@@ -737,6 +739,170 @@ function holidaySuite() {
 }
 
 holidaySuite()
+
+// ---------- 保存模式 / 设置指纹 / 跨页广播 ----------
+function saveModeSuite() {
+  // 保存方式：默认自动，只认 'manual'
+  eq(normalizeSettings({}).saveMode, 'auto', '默认自动保存')
+  eq(normalizeSettings({ saveMode: 'manual' }).saveMode, 'manual', 'manual 被保留')
+  eq(normalizeSettings({ saveMode: 'auto' }).saveMode, 'auto', 'auto 被保留')
+  eq(normalizeSettings({ saveMode: 'MANUAL' }).saveMode, 'auto', '大小写不匹配回落自动')
+  eq(normalizeSettings({ saveMode: true }).saveMode, 'auto', '非字符串回落自动')
+  eq(normalizeSettings({ saveMode: 1 }).saveMode, 'auto', '数字回落自动')
+
+  // 指纹：updatedAt 不参与比较（否则每次保存都会"变脏"）
+  const a = normalizeSettings({ apiKey: 'sk-aaaaaaaaaaaa', saveMode: 'manual' })
+  const b = Object.assign({}, a, { updatedAt: 123456 })
+  eq(settingsSignature(a), settingsSignature(b), 'updatedAt 不影响指纹')
+
+  const c = Object.assign({}, a, { apiKey: 'sk-bbbbbbbbbbbb' })
+  ok(settingsSignature(a) !== settingsSignature(c), 'Key 变了指纹就变')
+
+  // 界面上的对象可能是"没归一化"的：带空格、baseUrl 没协议/带尾斜杠。
+  // 指纹必须归一化后算，否则一进页面就显示"有未保存改动"
+  const raw = { apiKey: '  sk-aaaaaaaaaaaa  ', baseUrl: 'api.deepseek.com/', saveMode: 'manual' }
+  eq(settingsSignature(raw), settingsSignature(a), '未归一化的输入与归一化后指纹相同')
+
+  eq(settingsSignature(null), '', '空设置指纹为空串')
+
+  // 保存按钮状态
+  eq(saveButtonState(true), { label: '保存', enabled: true }, '有改动 → 保存可点')
+  eq(saveButtonState(false), { label: '已保存', enabled: false }, '无改动 → 显示已保存')
+
+  // 跨页广播：设置页落盘后 publishSettings，首页据此换掉自己那份
+  const rev0 = getUiState().settingsRev
+  eq(publishSettings(null).settingsRev, rev0, '广播 null 不递增 rev')
+
+  // 注意：回调拿到的是同一个 state 对象（实时引用），断言必须当场快照，
+  // 否则"退订后不再收到"永远测不出来 —— 读的其实是最新的 state 本身
+  let got = null
+  const unsub = subscribeUiState((s) => {
+    got = { rev: s.settingsRev, key: s.settings ? s.settings.apiKey : null }
+  })
+  const payload = normalizeSettings({ apiKey: 'sk-cccccccccccc', showBalance: false, saveMode: 'manual' })
+  publishSettings(payload)
+  eq(getUiState().settingsRev, rev0 + 1, '广播后 rev +1')
+  ok(getUiState().settings === payload, 'state.settings 指向刚广播的对象')
+  eq(getUiState().showBalance, false, 'showBalance 跟随 settings 一起广播')
+  ok(got && got.key === 'sk-cccccccccccc', '订阅者收到新设置')
+
+  const rev1 = getUiState().settingsRev
+  publishSettings(normalizeSettings({ apiKey: 'sk-dddddddddddd' }))
+  eq(getUiState().settingsRev, rev1 + 1, '再次广播继续递增 rev')
+  eq(getUiState().showBalance, true, '第二次广播把 showBalance 带回 true')
+
+  unsub()
+  const rev2 = getUiState().settingsRev
+  publishSettings(normalizeSettings({ apiKey: 'sk-eeeeeeeeeeee' }))
+  eq(getUiState().settingsRev, rev2 + 1, '退订后 rev 照常递增')
+  eq(got.key, 'sk-dddddddddddd', '退订后不再收到广播')
+}
+
+saveModeSuite()
+
+// ---------- 联网搜索 ----------
+function searchSuite() {
+  // 档位归一化：只认三档，其它一律关（老配置里是 webSearch bool，落不到这里）
+  eq(normalizeSearchMode('always'), 'always', 'searchMode always')
+  eq(normalizeSearchMode('auto'), 'auto', 'searchMode auto')
+  eq(normalizeSearchMode('on'), 'off', 'searchMode 未知值 → off')
+  eq(normalizeSearchMode(true), 'off', 'searchMode 旧布尔值 → off')
+  eq(normalizeSearchMode(undefined), 'off', 'searchMode 缺省 → off')
+
+  // 关档永远不搜（包括"每问必搜"档以外的一切）
+  eq(shouldSearch('今天北京的天气怎么样', 'off'), false, 'off 档不搜')
+
+  // 自动档：明显有时效/外部信息需求 → 搜
+  ok(shouldSearch('今天北京的天气怎么样', 'auto'), 'auto：天气要搜')
+  ok(shouldSearch('DeepSeek 最新发布的是什么模型', 'auto'), 'auto：最新动态要搜')
+  ok(shouldSearch('帮我查一下 iPhone 17 的价格', 'auto'), 'auto：明确要求查要搜')
+  ok(shouldSearch('2026年春节放假安排', 'auto'), 'auto：带年份的提问要搜')
+  ok(shouldSearch('https://example.com/a 这个页面讲了什么', 'auto'), 'auto：贴链接要搜')
+
+  // 自动档：明显不需要外部信息 → 不搜（这几条是最容易误伤的场景）
+  eq(shouldSearch('你好', 'auto'), false, 'auto：寒暄不搜')
+  eq(shouldSearch('继续', 'auto'), false, 'auto：接话不搜')
+  eq(shouldSearch('帮我写一个快速排序的函数', 'auto'), false, 'auto：写代码不搜')
+  eq(shouldSearch('翻译：hello world', 'auto'), false, 'auto：翻译不搜')
+  eq(shouldSearch('1+1 等于几', 'auto'), false, 'auto：算式不搜')
+  eq(shouldSearch('把上面这段润色一下', 'auto'), false, 'auto：润色不搜')
+  eq(shouldSearch('解释一下什么是递归', 'auto'), false, 'auto：概念解释不搜')
+
+  // 长文多半是"让我处理这份材料"，不搜
+  eq(shouldSearch('请总结以下内容：' + '这是一段很长的材料。'.repeat(40), 'auto'), false, 'auto：长材料不搜')
+
+  // 常开档：除了空字符串之外的都搜
+  ok(shouldSearch('你好', 'always'), 'always：寒暄也搜')
+  ok(shouldSearch('随便什么', 'always'), 'always：必搜')
+
+  // query 构建：短文本原样，长文本截到 128，markdown 结构被剥掉
+  eq(buildSearchQuery('  今天  北京  天气  '), '今天 北京 天气', 'query 压空白')
+  eq(buildSearchQuery('看这个 [链接](https://a.com) 说啥'), '看这个 链接 说啥', 'query 去 markdown 链接')
+  ok(buildSearchQuery('啊'.repeat(300)).length === 128, 'query 截到 128 字符')
+  eq(buildSearchQuery('```js\nvar a=1\n```\n这段代码有问题吗'), '这段代码有问题吗', 'query 去掉代码块')
+
+  // 结果解析：过滤空项、按 rerank_score 降序
+  const parsed = parseSearchResults({
+    results: [
+      { title: 'B', url: 'https://b.com/x', rerank_score: 1.2, summary: 's2', date: '2026-06-01T00:00:00+00:00', authority: 3 },
+      { title: 'A', url: 'https://www.a.com/y', rerank_score: 2.6, summary: 's1', authority: 4 },
+      { title: '', url: '' },
+      null
+    ]
+  })
+  eq(parsed.length, 2, '结果过滤空项')
+  eq(parsed[0].title, 'A', '结果按分数降序')
+  eq(parsed[0].score, 2.6, '保留 rerank_score')
+  eq(parseSearchResults(null), [], '空响应 → 空数组')
+  eq(parseSearchResults({ results: [] }), [], '无结果 → 空数组')
+
+  // 上下文渲染
+  const ctx = formatSearchContext(parsed, { max: 2, chunk: 10 })
+  ok(/【联网搜索结果】/.test(ctx), '上下文带标题')
+  ok(/\[1\] A/.test(ctx), '上下文编号从 1 开始')
+  ok(ctx.indexOf('https://www.a.com/y') > 0, '上下文含 URL')
+  ok(/发布 2026-06-01/.test(ctx), '上下文含发布日期')
+  ok(/…/.test(formatSearchContext(parsed, { chunk: 1 })), '长摘要被截断')
+  eq(formatSearchContext([]), '', '无结果不生成上下文')
+
+  // 来源展示
+  const srcs = searchSources(parsed, 4)
+  eq(srcs.length, 2, '来源条数')
+  eq(srcs[0].host, 'a.com', 'host 去掉 www.')
+  eq(hostOf('https://sub.example.com/a/b?c=1'), 'sub.example.com', 'host 保留子域')
+  eq(hostOf('not a url'), '', '非法 url → 空 host')
+
+  // 注入位置：必须在最后一条 user 之前，否则 system 会变成末条
+  const msgs = [
+    { role: 'system', content: 'sys' },
+    { role: 'user', content: 'q1' },
+    { role: 'assistant', content: 'a1' },
+    { role: 'user', content: 'q2' }
+  ]
+  const injected = injectSearchContext(msgs, ctx)
+  eq(injected.length, 5, '注入后多一条')
+  eq(injected[3].role, 'system', '上下文插在最后一条 user 之前')
+  eq(injected[4].content, 'q2', '最后一条仍是 user')
+  eq(msgs.length, 4, '不改原数组')
+  eq(injectSearchContext(msgs, ''), msgs, '空上下文原样返回')
+
+  // describeBody 能反映"已注入"
+  const b = buildBody(defaultParams(), injectSearchContext([{ role: 'user', content: 'q' }], ctx))
+  ok(/联网搜索结果=已注入/.test(describeBody(b.body)), 'describeBody 标记已注入')
+
+  // 设置归一化：searchMode 走 enum 分支，非法值回落到 off
+  eq(normalizeSettings({ params: { searchMode: 'always' } }).params.searchMode, 'always', '设置保留 always')
+  eq(normalizeSettings({ params: { searchMode: 'bogus' } }).params.searchMode, 'off', '设置非法值 → off')
+  eq(normalizeSettings({ params: { webSearch: true } }).params.searchMode, 'off', '旧 webSearch 字段不再生效')
+  eq(normalizeSettings({ params: { searchCount: 99 } }).params.searchCount, 10, 'searchCount 上限钳制')
+  eq(normalizeSettings({ params: { searchCount: 0 } }).params.searchCount, 1, 'searchCount 下限钳制')
+
+  // 搜索结果数在关档时置灰
+  eq(scopeOf('searchCount', { searchMode: 'off' }).active, false, '关档时结果数不生效')
+  eq(scopeOf('searchCount', { searchMode: 'auto' }).active, true, '自动档时结果数生效')
+}
+
+searchSuite()
 
 console.log('\n' + (fail === 0 ? '✅ 全部通过' : '❌ 有失败') + '：' + pass + ' 项断言，' + fail + ' 项失败')
 if (fail) {

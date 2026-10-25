@@ -17,6 +17,9 @@ export const DEFAULT_SETTINGS = {
   // 主页顶栏是否显示「余额 + 峰谷」芯片。关掉只是不显示、也不再定时查余额，
   // 设置页「账户」里的余额/时段照常可查
   showBalance: true,
+  // 保存方式：'auto' 改一项存一项；'manual' 只在点顶部「保存」时落盘。
+  // 两者互斥 —— manual 下所有改动只留在内存，顶部才会出现保存按钮
+  saveMode: 'auto',
   params: defaultParams(),
   updatedAt: 0
 }
@@ -50,6 +53,8 @@ export function normalizeSettings(raw) {
     maxHistory: clampInt(src.maxHistory, 0, 40, DEFAULT_SETTINGS.maxHistory),
     // 只有显式写 false 才关（老配置文件里没这个字段 → 视为开）
     showBalance: src.showBalance === false ? false : true,
+    // 只认 'manual'，其它一律按自动保存（老配置没有这个字段 → 自动保存）
+    saveMode: src.saveMode === 'manual' ? 'manual' : 'auto',
     params: Object.assign({}, defaultParams(), src.params && typeof src.params === 'object' ? src.params : {}),
     updatedAt: Number(src.updatedAt) || 0
   }
@@ -92,4 +97,19 @@ function clampInt(v, min, max, dft) {
 
 export function isReady(settings) {
   return !!(settings && settings.apiKey && settings.apiKey.length > 8)
+}
+
+// 「是否改过」用的指纹：归一化后去掉 updatedAt 再序列化。
+// 归一化是必须的 —— 界面上的对象可能带着未裁剪的空格、未规范化的 baseUrl，
+// 直接 JSON.stringify 会一直报「有未保存改动」。
+export function settingsSignature(s) {
+  if (!s) return ''
+  const o = normalizeSettings(s)
+  o.updatedAt = 0
+  return JSON.stringify(o)
+}
+
+// 手动保存模式下顶栏保存按钮的文案/是否可点，抽成纯函数好测
+export function saveButtonState(dirty) {
+  return dirty ? { label: '保存', enabled: true } : { label: '已保存', enabled: false }
 }

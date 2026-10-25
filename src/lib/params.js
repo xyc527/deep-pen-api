@@ -164,8 +164,22 @@ export const PARAMS = [
     doc: 'stream_options.include_usage；必须与 stream=true 同时出现，否则 400'
   },
   {
-    key: 'webSearch', group: 'experimental', label: '联网搜索', kind: 'bool', default: false,
-    doc: '预留：发送 web_search_options。官方文档未公开该字段；实测端点接受（HTTP 200）但不会真正检索——模型仍答“无法获取实时数据”。仅作端点预留'
+    // 以前这里是 webSearch(bool)，发的是官方未公开的 web_search_options ——
+    // 端点收下但不检索，模型照样答“无法获取实时数据”，等于安慰剂。现在删掉那个假字段，
+    // 换成真的：提问前先调 POST /v1/tools/search 拿资料，再把资料注入上下文。
+    key: 'searchMode', group: 'web', label: '联网搜索', kind: 'enum',
+    options: [
+      { value: 'off', label: '关' },
+      { value: 'auto', label: '自动' },
+      { value: 'always', label: '常开' }
+    ],
+    default: 'off',
+    doc: '关=不搜；自动=仅在问题明显有时效/外部信息需求时搜（本地规则判断，零额外延迟）；常开=每问必搜。搜索按次计费 5 元/1000 次'
+  },
+  {
+    key: 'searchCount', group: 'web', label: '搜索结果数', kind: 'number',
+    scope: 'search', min: 1, max: 10, step: 1, default: 6,
+    doc: '每次搜索取回并注入上下文的网页条数（1–10）。条数不影响计费，只影响注入的上下文长度'
   },
   {
     key: 'userId', group: 'experimental', label: '用户标识', kind: 'text', default: '',
@@ -201,6 +215,10 @@ export function scopeOf(key, params) {
   }
   if (p.scope === 'logprobs' && !params.logprobs) {
     return { active: false, reason: '需先开启"返回对数概率"' }
+  }
+  // 搜索结果数只在联网搜索开着时才有意义
+  if (p.scope === 'search' && String(params.searchMode || 'off') === 'off') {
+    return { active: false, reason: '需先在「联网搜索」里选择 自动 或 常开' }
   }
   return { active: true, reason: '' }
 }
@@ -303,12 +321,6 @@ export function buildBody(params, messages, opts) {
     body.stream_options = { include_usage: true }
   }
 
-  if (p.webSearch) {
-    // 预留的联网搜索入口。官方文档未公开该字段；实测会被接受并影响检索行为。
-    body.web_search_options = { search_context_size: 'high' }
-    warnings.push('联网搜索为实验特性，官方文档未公开该字段')
-  }
-
   if (p.userId) body.user_id = p.userId
 
   return { ok: errors.length === 0, body: body, warnings: warnings, errors: errors }
@@ -325,7 +337,9 @@ export function describeBody(body) {
   if (body.thinking) out.push('thinking=' + body.thinking.type)
   if (body.response_format) out.push('response_format=' + body.response_format.type)
   if (body.stream_options) out.push('stream_options=include_usage')
-  if (body.web_search_options) out.push('web_search_options=on')
+  if (body.messages && body.messages.some && body.messages.some((m) => m && m.role === 'system' && /【联网搜索结果】/.test(String(m.content || '')))) {
+    out.push('联网搜索结果=已注入')
+  }
   out.push('messages=' + (body.messages ? body.messages.length : 0) + '条')
   return out.join('  ')
 }

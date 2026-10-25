@@ -7,12 +7,26 @@
 //
 // 这里用一个模块级单例 + 订阅：设置页改完立刻广播，首页实例（即使不在前台）
 // 收到就改自己的 data，回去时已经是正确状态，不依赖 onShow 是否被调用。
+//
+// settings 整包也走这条通道：API Key / 服务地址 / 采样参数改了之后，
+// 首页下一次发请求必须用新值 —— 否则「改了 Key 仍能继续聊」就是必然结果。
+// rev 递增是为了让首页能判断"手上这份比广播的旧"，而不是逐字段比对。
 
 const state = {
-  showBalance: true
+  showBalance: true,
+  settings: null,
+  settingsRev: 0
 }
 
 const subs = []
+
+function notify() {
+  // 复制一份再遍历：回调里可能退订，直接迭代原数组会漏项
+  const list = subs.slice()
+  for (let i = 0; i < list.length; i++) {
+    try { list[i](state) } catch (e) { /* 单个订阅出错不能影响其它页面 */ }
+  }
+}
 
 export function getUiState() {
   return state
@@ -28,11 +42,17 @@ export function setUiState(patch) {
     }
   }
   if (!changed) return state
-  // 复制一份再遍历：回调里可能退订，直接迭代原数组会漏项
-  const list = subs.slice()
-  for (let i = 0; i < list.length; i++) {
-    try { list[i](state) } catch (e) { /* 单个订阅出错不能影响其它页面 */ }
-  }
+  notify()
+  return state
+}
+
+// 广播整份设置（落盘成功之后调用）。rev 每次 +1，首页据此判断要不要换掉自己那份。
+export function publishSettings(settings) {
+  if (!settings) return state
+  state.settings = settings
+  state.settingsRev = state.settingsRev + 1
+  state.showBalance = settings.showBalance !== false
+  notify()
   return state
 }
 

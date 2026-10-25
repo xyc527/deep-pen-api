@@ -20,6 +20,7 @@ import { execShell, readText, writeText, removeFile, exists, ensureAppDir, joinP
 import { parseSse, readChunk } from '../lib/sse.js'
 import { holidaySources, parseHolidayPayload, HOLIDAY_UA } from '../lib/holiday.js'
 import { holdIncompleteTail, stripInternalTags } from '../lib/text.js'
+import { parseSearchResults } from '../lib/search.js'
 
 const POLL_MS = 120
 const TMP_KEEP = false
@@ -434,11 +435,13 @@ function explainCurl(errText) {
   return one
 }
 
-// 非流式（stream=false）：一次拿完整 JSON
-export async function sendOnce(opts) {
+// 非流式 POST：一次拿完整 JSON。
+// sendOnce（chat）和 searchWeb（tools/search）共用这段轮询骨架 ——
+// 两者的差别只有路径和返回体解析，没必要各写一遍。
+async function postJson(opts) {
   const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS
   const files = buildCurl({
-    baseUrl: opts.baseUrl, apiKey: opts.apiKey, path: '/chat/completions',
+    baseUrl: opts.baseUrl, apiKey: opts.apiKey, path: opts.path,
     method: 'POST', body: opts.body, timeoutMs: timeoutMs
   })
   try {
@@ -463,17 +466,59 @@ export async function sendOnce(opts) {
       if (!status && errText) throw apiErr('NETWORK', explainCurl(errText))
       throw apiErr('HTTP_' + status, explainError(status, body), body)
     }
-    let obj = null
-    try { obj = JSON.parse(body) } catch (e) { throw apiErr('PARSE', '返回内容无法解析') }
-    const msg = obj && obj.choices && obj.choices[0] && obj.choices[0].message
-    return {
-      content: stripInternalTags((msg && msg.content) || ''),
-      reasoning: stripInternalTags((msg && msg.reasoning_content) || ''),
-      usage: obj.usage || null,
-      finishReason: (obj.choices && obj.choices[0] && obj.choices[0].finish_reason) || 'stop',
-      status: status
-    }
+    return { status: status, body: body }
   } finally {
     await cleanup(files)
+  }
+}
+
+// 联网搜索：POST /v1/tools/search
+// 官方是原始 JSON API，不是 SSE —— 一次请求一次响应，比 chat 简单。
+// baseUrl 默认带 /v1（chat/models 的约定），所以这里只拼 /tools/search。
+// 计费：0.005 元/次成功请求（返回非空 results 才收费）。
+export async function searchWeb(opts) {
+  const count = Math.max(1, Math.min(10, parseInt(opts.count, 10) || 6))
+  const body = {
+    query: String(opts.query || '').slice(0, 128),
+    count: count,
+    need_content: false
+  }
+  if (opts.oriQuestion) body.ori_question = String(opts.oriQuestion).slice(0, 128)
+
+  let r
+  try {
+    r = await postJson({
+      baseUrl: opts.baseUrl, apiKey: opts.apiKey, path: '/tools/search',
+      body: body, timeoutMs: opts.timeoutMs || 15000, shouldCancel: opts.shouldCancel
+    })
+  } catch (e) {
+    // 第三方反代一般没实现这个端点 → 404 说清楚，别让人以为是 Key 到期
+    if (e && e.code === 'HTTP_404') {
+      throw apiErr('NO_SEARCH', '该服务地址没有搜索接口（/tools/search 仅官方地址可用）')
+    }
+    throw e
+  }
+
+  let obj = null
+  try { obj = JSON.parse(r.body) } catch (e) { throw apiErr('PARSE', '搜索结果无法解析') }
+  return { results: parseSearchResults(obj), status: r.status }
+}
+
+// 非流式（stream=false）：一次拿完整 JSON
+export async function sendOnce(opts) {
+  const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS
+  const r = await postJson({
+    baseUrl: opts.baseUrl, apiKey: opts.apiKey, path: '/chat/completions',
+    body: opts.body, timeoutMs: timeoutMs, shouldCancel: opts.shouldCancel
+  })
+  let obj = null
+  try { obj = JSON.parse(r.body) } catch (e) { throw apiErr('PARSE', '返回内容无法解析') }
+  const msg = obj && obj.choices && obj.choices[0] && obj.choices[0].message
+  return {
+    content: stripInternalTags((msg && msg.content) || ''),
+    reasoning: stripInternalTags((msg && msg.reasoning_content) || ''),
+    usage: obj.usage || null,
+    finishReason: (obj.choices && obj.choices[0] && obj.choices[0].finish_reason) || 'stop',
+    status: r.status
   }
 }

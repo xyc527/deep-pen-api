@@ -22,6 +22,21 @@
                     <div v-if="m.role === 'assistant' && !m.pending" class="ix-meta" @click="toggleReason(m)"><text class="ix-metatxt">{{ reasonToggle(m) }}</text></div>
                 </div>
 
+                <!-- 联网检索中的状态。搜索是同步请求，1–3 秒才有结果，
+                     不给提示的话屏幕上毫无变化，看着像卡死 -->
+                <div v-if="m.searching" class="ix-searching">
+                    <text class="ix-searchingtxt">正在联网检索…</text>
+                </div>
+
+                <!-- 来源：默认只占一行，点开看标题。不显示 URL —— 笔上点不了链接，
+                     列出来只会占地方 -->
+                <div v-if="m.sources && m.sources.length" class="ix-srcs" @click="toggleSources(m)">
+                    <text class="ix-srctxt">{{ sourcesLabel(m) }}</text>
+                </div>
+                <div v-if="m.sources && m.sources.length && srcOpen(m.id)" class="ix-srclist">
+                    <text v-for="(s, si) in m.sources" :key="si" class="ix-srcitem">{{ (si + 1) + '. ' + s.title + (s.host ? '（' + s.host + '）' : '') }}</text>
+                </div>
+
                 <!-- 思考过程（可折叠） -->
                 <div v-if="m.reasoning && reasonOpen(m)" :class="cls('ix-reason', m)">
                     <text :class="cls('ix-reasontext', m)">{{ m.reasoning }}</text>
@@ -139,7 +154,7 @@
 
 <script>
 import { loadSettings, saveSettings, loadChats, saveChats, loadPhotoSeen, savePhotoSeen, loadBalance, saveBalance } from '../../services/store.js'
-import { sendChat, sendOnce, fetchBalance } from '../../services/api.js'
+import { sendChat, sendOnce, fetchBalance, searchWeb } from '../../services/api.js'
 import { restoreHoliday, ensureHoliday } from '../../services/holiday.js'
 import { openTextEditor } from '../../services/ime.js'
 import { listPhotos, toDataUrl, launchCamera, photoDirStamp } from '../../services/media.js'
@@ -152,13 +167,16 @@ import { buildApiMessages, newConversation, newMessage, ensureTitle, summarizeUs
 import { addPhoto, removePhoto, diffNewPhotos, formatSize } from '../../lib/photos.js'
 import { billingPeriod, setTimeSkew, nowMs } from '../../lib/peak.js'
 import { balanceChipText, balanceLevel } from '../../lib/balance.js'
-import { setUiState, subscribeUiState } from '../../lib/uistate.js'
+import { setUiState, subscribeUiState, getUiState } from '../../lib/uistate.js'
+import { normalizeSearchMode, shouldSearch, buildSearchQuery, formatSearchContext, searchSources, injectSearchContext } from '../../lib/search.js'
 
 const MAX_IMAGES = 4
 
 // 渲染计划缓存放在模块作用域（不要放进 data：写 data 会在渲染期触发重渲染）
 const planCache = {}
 const reasonOpenSet = {}
+// 联网来源的展开状态（同样放模块作用域）
+const srcOpenSet = {}
 // 流式节流用的临时表（放模块作用域，避免写 data 触发额外重渲染）
 const streamBuf = {}
 const streamTimers = {}
@@ -175,6 +193,8 @@ export default {
         return {
             view: 'chat',
             settings: null,
+            // 手上这份 settings 对应哪一次广播（见 lib/uistate.js 的 settingsRev）
+            settingsRev: 0,
             convs: [],
             convId: '',
             draft: '',
@@ -230,17 +250,23 @@ export default {
             const on = this.settings && this.settings.params.thinking !== false
             return on ? 'ix-chiptxt-on' : 'ix-chiptxt'
         },
-        searchTxtClass() {
-            const on = this.settings && this.settings.params.webSearch === true
-            return on ? 'ix-chiptxt-on' : 'ix-chiptxt'
+        searchMode() {
+            return normalizeSearchMode(this.settings && this.settings.params.searchMode)
         },
+        searchTxtClass() {
+            return this.searchMode === 'off' ? 'ix-chiptxt' : 'ix-chiptxt-on'
+        },
+        // 三档一眼可辨：关（灰）/ 自动（亮）/ 常开（亮）
         searchLabel() {
-            const on = this.settings && this.settings.params.webSearch === true
-            return on ? '联网 开' : '联网 关'
+            const m = this.searchMode
+            if (m === 'always') return '联网 常开'
+            if (m === 'auto') return '联网 自动'
+            return '联网 关'
         },
         searchChipClass() {
-            const on = this.settings && this.settings.params.webSearch === true
-            return on ? 'ix-chip-on' : 'ix-chip'
+            if (this.searchMode === 'off') return 'ix-chip'
+            if (this.searchMode === 'always') return 'ix-chip-on-strong'
+            return 'ix-chip-on'
         },
         // 芯片文案：¥12.34·谷。没查过就只写「余额」，让用户知道可以点
         balLabel() {
@@ -283,9 +309,17 @@ export default {
         }
     },
     mounted() {
-        // 设置页改了「主页显示」要立刻生效，不能等 onShow —— 实测这个固件
-        // 从设置页返回首页时不触发首页 onShow，芯片就会"点了隐藏还挂着"
+        // 设置页改完立刻生效，不能等 onShow —— 实测这个固件从设置页返回首页时
+        // 不触发首页 onShow。以前只同步了「主页显示」一个开关，API Key / 服务地址 /
+        // 模型 / 采样参数全都同步不过来：用户把 Key 改错，返回后照样能聊，
+        // 因为发请求用的是这份旧 settings。
         this.unsubUi = subscribeUiState((s) => {
+            if (s.settings && s.settingsRev !== this.settingsRev) {
+                this.settingsRev = s.settingsRev
+                this.settings = s.settings
+                this.applyShowBalance(s.settings)
+                return
+            }
             if (this.showBal === s.showBalance) return
             this.showBal = s.showBalance
             // 刚打开就补一次余额，别让芯片空着显示「余额」
@@ -314,6 +348,7 @@ export default {
     methods: {
         async boot() {
             this.settings = await loadSettings()
+            this.settingsRev = getUiState().settingsRev
             this.applyShowBalance(this.settings)
             if (!isReady(this.settings)) {
                 navTo('setup', {})
@@ -443,6 +478,7 @@ export default {
             const s = await loadSettings()
             if (!s) return
             this.settings = s
+            this.settingsRev = getUiState().settingsRev
             this.applyShowBalance(s)
             if (!isReady(s)) {
                 navTo('setup', {})
@@ -621,13 +657,18 @@ export default {
             this.settings.params = p
             saveSettings(this.settings)
         },
+        // 三档循环：关 → 自动 → 常开 → 关。
+        // 「自动」靠本地规则判断（lib/search.js），零额外请求、零延迟；
+        // 「常开」每问必检索，一次 0.005 元，所以文案里把价钱说清楚。
         toggleSearch() {
-
-            const p = Object.assign({}, this.settings.params)
-            p.webSearch = !p.webSearch
-            this.settings.params = p
+            const cur = this.searchMode
+            const next = cur === 'off' ? 'auto' : (cur === 'auto' ? 'always' : 'off')
+            const p = Object.assign({}, this.settings.params, { searchMode: next })
+            this.settings = Object.assign({}, this.settings, { params: p })
             saveSettings(this.settings)
-            this.flash(p.webSearch ? '联网搜索：开（已发 web_search_options，实测不生效）' : '联网搜索：关')
+            if (next === 'off') this.flash('联网搜索：关')
+            else if (next === 'auto') this.flash('联网搜索：自动（仅在需要时检索）')
+            else this.flash('联网搜索：常开（每问必检索，约 0.005 元/次）')
         },
 
         // ---------- 发送 ----------
@@ -652,6 +693,22 @@ export default {
             return map
         },
 
+        // 发请求前确认手上这份设置是最新的。
+        // 设置页每次落盘都会 publishSettings（rev+1），这里 rev 不一致就重读一遍磁盘 ——
+        // 万一订阅回调因为页面重建/时序没跑到，也不会用旧 Key 发请求。
+        async ensureFreshSettings() {
+            const rev = getUiState().settingsRev
+            if (rev !== this.settingsRev) {
+                const s = await loadSettings()
+                if (s) {
+                    this.settings = s
+                    this.settingsRev = rev
+                    this.applyShowBalance(s)
+                }
+            }
+            return this.settings
+        },
+
         async send() {
             if (this.busy) return
             const text = String(this.draft || '').trim()
@@ -660,7 +717,12 @@ export default {
                 return
             }
             const conv = this.ensureConv()
-            const settings = this.settings
+            const settings = await this.ensureFreshSettings()
+            // 设置页把 Key 清掉/改废了也要给出明确提示，而不是拿旧 Key 继续发
+            if (!settings || !isReady(settings)) {
+                this.flash('还没填有效的 API Key，去「设置 → 连接」填一下')
+                return
+            }
 
             const userMsg = newMessage('user', text)
             userMsg.images = this.images.slice()
@@ -685,7 +747,38 @@ export default {
                     maxMessages: settings.maxHistory * 2,
                     imageUrlOf: (path) => urlMap[path] || this.urlCache[path] || null
                 })
-                const built = buildBody(settings.params, apiMsgs)
+
+                // ---- 联网搜索：先检索，再把资料注入上下文 ----
+                // 官方 /v1/tools/search 是纯检索接口，不会自己判断该不该搜，
+                // 所以「自动」档靠 lib/search.js 的本地规则判断（零请求、零延迟）。
+                const searchMode = normalizeSearchMode(settings.params.searchMode)
+                let searchCtx = ''
+                if (shouldSearch(text, searchMode)) {
+                    const q = buildSearchQuery(text)
+                    bot.searching = true
+                    try {
+                        const sr = await searchWeb({
+                            baseUrl: settings.baseUrl,
+                            apiKey: settings.apiKey,
+                            query: q,
+                            oriQuestion: q,
+                            count: settings.params.searchCount,
+                            shouldCancel: () => this.cancelled
+                        })
+                        searchCtx = formatSearchContext(sr.results, { max: settings.params.searchCount })
+                        if (searchCtx) bot.sources = searchSources(sr.results, 4)
+                        log('SEARCH ' + q + ' -> ' + sr.results.length + '条')
+                    } catch (e) {
+                        // 搜索失败绝不能连累回答：降级成"不搜直接答"，只提示一句
+                        if (e && e.code === 'CANCELLED') throw e
+                        log('SEARCH ERR ' + ((e && e.message) || e))
+                        this.flash('联网搜索失败，已直接回答：' + ((e && e.message) || '未知错误'))
+                    } finally {
+                        bot.searching = false
+                    }
+                }
+
+                const built = buildBody(settings.params, injectSearchContext(apiMsgs, searchCtx))
                 if (!built.ok) throw new Error(built.errors.join('；'))
                 if (built.warnings.length) this.flash(built.warnings[0])
                 log('REQ ' + describeBody(built.body))
@@ -863,6 +956,18 @@ export default {
         },
         toggleReason(m) {
             reasonOpenSet[m.id] = !this.reasonOpen(m)
+            this.$forceUpdate()
+        },
+        // 联网来源：默认收起，展开看标题。和「思考过程」同一套开关方式
+        srcOpen(m) {
+            return srcOpenSet[m.id] === true
+        },
+        sourcesLabel(m) {
+            const n = (m.sources || []).length
+            return '已联网 · ' + n + ' 条来源' + (this.srcOpen(m) ? ' ▲' : ' ▼')
+        },
+        toggleSources(m) {
+            srcOpenSet[m.id] = !this.srcOpen(m)
             this.$forceUpdate()
         },
         convRowStyle(c) {
@@ -1103,6 +1208,47 @@ export default {
 .ix-metatxt {
     font-size: 11px;
     color: #6d6d7c;
+}
+
+/* 「常开」用琥珀色：它每问都会花钱，视觉上要和「自动」的绿区分开 */
+.ix-chip-on-strong {
+    flex-direction: row;
+    align-items: center;
+    height: 26px;
+    padding-left: 10px;
+    padding-right: 10px;
+    border-radius: 6px;
+    background-color: #f59e0b;
+    margin-left: 8px;
+}
+
+.ix-searching {
+    flex-direction: row;
+    align-items: center;
+    margin-top: 4px;
+}
+.ix-searchingtxt {
+    font-size: 12px;
+    color: #7dd3fc;
+}
+.ix-srcs {
+    flex-direction: row;
+    align-items: center;
+    margin-top: 4px;
+}
+.ix-srctxt {
+    font-size: 11px;
+    color: #7dd3fc;
+}
+.ix-srclist {
+    flex-direction: column;
+    margin-top: 2px;
+    padding-left: 4px;
+}
+.ix-srcitem {
+    font-size: 11px;
+    color: #8a8a99;
+    margin-top: 2px;
 }
 
 .ix-reason {

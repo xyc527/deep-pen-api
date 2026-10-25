@@ -35,6 +35,7 @@ import { openTextEditor } from '../../services/ime.js'
 import { testConnection } from '../../services/api.js'
 import { navTo, log } from '../../services/platform.js'
 import { maskKey, normalizeBaseUrl, isReady } from '../../lib/settings.js'
+import { publishSettings } from '../../lib/uistate.js'
 
 export default {
     name: 'setup',
@@ -69,19 +70,36 @@ export default {
     },
     methods: {
         async load() {
+            // normalizeSettings 已经保证 baseUrl 有默认值，这里不需要再补
             this.settings = await loadSettings()
-            if (!this.settings.baseUrl) this.settings.baseUrl = 'https://api.deepseek.com/v1'
+        },
+        // 首次配置也要"改完就落盘"：以前只在点「测试连接 / 保存并进入」时才写，
+        // 中途返回（或应用被系统回收）这次输入就没了 —— 用户看到的就是
+        // "第一次填的 Key 填完就消失"。现在每次编辑立刻保存并回读确认。
+        applyAndSave(patch) {
+            this.settings = Object.assign({}, this.settings, patch || {})
+            const saved = saveSettings(this.settings)
+            if (!saved) { this.status = '保存失败：写入配置失败，请重试'; return false }
+            this.settings = saved
+            publishSettings(saved)
+            return true
         },
         async editKey() {
+            if (!this.settings) { this.status = '配置还在读取，请稍候再点'; return }
             const text = await openTextEditor(this.settings.apiKey || '', { multiLine: false, confirmText: '确定', maxlength: 200 })
             if (text === null || text === undefined) return
-            this.settings.apiKey = String(text).trim()
-            this.status = ''
+            const key = String(text).trim()
+            if (!this.applyAndSave({ apiKey: key })) return
+            const disk = await loadSettings()
+            if (!disk || disk.apiKey !== key) { this.status = '保存失败：磁盘上的 Key 与输入不一致'; return }
+            this.status = isReady(this.settings) ? '已保存到本机' : 'Key 太短，请检查是否复制完整'
+            log('setup key saved len=' + key.length)
         },
         async editBase() {
+            if (!this.settings) { this.status = '配置还在读取，请稍候再点'; return }
             const text = await openTextEditor(this.settings.baseUrl || '', { multiLine: false, confirmText: '确定', maxlength: 200 })
             if (text === null || text === undefined) return
-            this.settings.baseUrl = normalizeBaseUrl(text)
+            if (this.applyAndSave({ baseUrl: normalizeBaseUrl(text) })) this.status = '服务地址已保存'
         },
         async test() {
             if (this.testing) return
@@ -94,13 +112,9 @@ export default {
             this.testing = false
             if (!r.ok) { this.status = r.error || '连接失败'; return }
             const ids = r.models.map((m) => m.id)
-            this.settings.models = r.models.map((m) => ({ id: m.id, label: m.id }))
-            if (ids.length && ids.indexOf(this.settings.params.model) < 0) {
-                const p = Object.assign({}, this.settings.params)
-                p.model = ids[0]
-                this.settings.params = p
-            }
-            saveSettings(this.settings)
+            const p = Object.assign({}, this.settings.params)
+            if (ids.length && ids.indexOf(p.model) < 0) p.model = ids[0]
+            if (!this.applyAndSave({ models: r.models.map((m) => ({ id: m.id, label: m.id })), params: p })) return
             this.status = '连接成功，可用模型：' + ids.join(' / ')
             log('models ' + ids.join(','))
         },
@@ -109,7 +123,7 @@ export default {
                 this.status = '请先填入有效的 API Key'
                 return
             }
-            saveSettings(this.settings)
+            if (!this.applyAndSave({})) return
             navTo('index', {})
         }
     }
