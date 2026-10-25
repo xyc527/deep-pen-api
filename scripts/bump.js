@@ -39,5 +39,21 @@ if (next === cur) {
 
 pkg.version = next
 fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n')
+
+// package-lock.json 里也有两处版本号（顶层 version 和 packages[""].version），
+// 只改 package.json 会让两者越走越远；npm ci 不看这个字段，但人看着会以为没升版。
+const lockFile = path.resolve(__dirname, '..', 'package-lock.json')
+if (fs.existsSync(lockFile)) {
+  try {
+    const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
+    lock.version = next
+    if (lock.packages && lock.packages['']) lock.packages[''].version = next
+    fs.writeFileSync(lockFile, JSON.stringify(lock, null, 2) + '\n')
+    console.log('[bump] package-lock.json 已同步')
+  } catch (e) {
+    console.log('[bump] package-lock.json 同步失败（忽略）：' + e.message)
+  }
+}
+
 console.log('[bump] ' + cur + ' → ' + next)
 console.log('[bump] 出包名：' + pkg.appid + '.' + next.replace(/\./g, '_') + '.amr')
