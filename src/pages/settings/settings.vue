@@ -136,14 +136,41 @@
                     <text class="st-previewtext">{{ preview }}</text>
                 </div>
             </div>
+
+            <!-- 诊断：保存不上时，用户能自己把原因读出来（否则只能"我这边复现不了"） -->
+            <div class="st-group">
+                <text class="st-gtitle">诊断</text>
+                <div class="st-row">
+                    <text class="st-label">写入自检</text>
+                    <div class="st-btn2" @click="runSelfTest"><text class="st-btn2txt">{{ diagBusy ? '检测中…' : '运行' }}</text></div>
+                    <text class="st-doc">建目录 → 写测试文件 → 读回比对；失败会指出卡在哪一步</text>
+                </div>
+                <div class="st-row">
+                    <text class="st-label">版本</text>
+                    <div class="st-ctl"><text class="st-text">{{ appVer }}</text></div>
+                    <text class="st-doc">数据目录 {{ dataDir }}</text>
+                </div>
+                <div class="st-row">
+                    <text class="st-label">日志</text>
+                    <div class="st-btn2" @click="refreshDiag"><text class="st-btn2txt">刷新</text></div>
+                    <text class="st-doc">最近 10 行，存在同目录 app.log</text>
+                </div>
+                <div class="st-preview">
+                    <text class="st-logtext">{{ diagMsg }}</text>
+                </div>
+                <div class="st-preview">
+                    <text class="st-logtext">{{ logTailText }}</text>
+                </div>
+            </div>
         </scroller>
     </div>
 </template>
 
 <script>
-import { loadSettings, saveSettings, loadBalance as loadBalanceCache, saveBalance } from '../../services/store.js'
+import { loadSettings, saveSettings, loadBalance as loadBalanceCache, saveBalance, selfTestWrite, getLastSaveInfo } from '../../services/store.js'
 import { openTextEditor } from '../../services/ime.js'
-import { navTo, deviceInfo, log } from '../../services/platform.js'
+import { navTo, deviceInfo, log, logTail, appDir } from '../../services/platform.js'
+import { APP_VERSION } from '../../lib/appversion.js'
 import { listModels, testConnection, fetchBalance } from '../../services/api.js'
 import { PARAMS, PARAM_MAP, defaultParams, clampNumber, buildBody, describeBody, modelOptions } from '../../lib/params.js'
 import { maskKey, normalizeBaseUrl, isReady, settingsSignature } from '../../lib/settings.js'
@@ -186,6 +213,12 @@ export default {
             // 和当前设置一比对就知道有没有未保存改动（手动模式才有意义）
             saveMsg: '',
             savedSig: '',
+            // 诊断
+            appVer: APP_VERSION,
+            dataDir: '',
+            diagBusy: false,
+            diagMsg: '',
+            logTailText: '',
             dirty: false,
             leaveWarn: false
         }
@@ -379,6 +412,7 @@ export default {
             // 记下"磁盘上那份"的指纹，手动保存模式用它判断有没有未保存改动
             this.savedSig = settingsSignature(this.settings)
             this.dirty = false
+            this.refreshDiag()
             // 把落盘的真实值广播一次：首页可能拿着旧值（先开首页再进设置），
             // 而返回上一页时固件不触发首页 onShow，只能靠这条通道
             setUiState({ showBalance: this.settings.showBalance !== false })
@@ -520,9 +554,13 @@ export default {
             if (!this.settings) return false
             const saved = saveSettings(this.settings)
             if (!saved) {
-                this.saveMsg = '保存失败：写入配置失败，请重试'
+                // 顶栏只放得下一句话；真实原因放诊断区并已写进 app.log
+                const info = getLastSaveInfo()
+                this.saveMsg = '保存失败：写入被拒绝'
+                this.diagMsg = '上次保存失败：' + (info.reason || 'unknown') + '\n目标 ' + info.path
                 this.refreshDirty()
-                log('saveSettings 返回 null')
+                log('saveSettings 返回 null :: ' + info.reason)
+                this.refreshDiag()
                 return false
             }
             this.settings = saved
@@ -532,12 +570,48 @@ export default {
             this.saveMsg = '已保存'
             // 首页靠这条通道换掉自己那份 settings（返回上一页不触发 onShow）
             publishSettings(saved)
+            this.verifySavedSoon(saved)
             return true
+        },
+        // 写一次不算数：本机 writeFile 会"不报错也不落盘"，必须读回比对。
+        // 放在 300ms 后做，不挡操作；真的对不上再翻脸，并把日志摆到诊断区。
+        verifySavedSoon(expected) {
+            const sig = settingsSignature(expected)
+            setTimeout(async () => {
+                const disk = await loadSettings()
+                if (!disk) return
+                if (settingsSignature(disk) === sig) return
+                this.saveMsg = '保存失败：写后读回不一致'
+                this.diagMsg = '写后读回不一致，已记入日志\n目标 ' + appDir() + '/settings.json'
+                log('settings 写后读回不一致')
+                this.refreshDiag()
+            }, 300)
         },
         saveNow() {
             if (this.isAutoSave) { this.saveMsg = '当前是自动保存，无需手动保存'; return }
             if (!this.dirty) { this.saveMsg = '没有需要保存的改动'; return }
             this.persist()
+        },
+        // ---------- 诊断 ----------
+        refreshDiag() {
+            this.logTailText = logTail(10) || '(日志为空)'
+            this.dataDir = appDir()
+        },
+        async runSelfTest() {
+            if (this.diagBusy) return
+            this.diagBusy = true
+            this.diagMsg = '正在自检…'
+            const r = await selfTestWrite()
+            this.diagBusy = false
+            if (r.ok) {
+                this.diagMsg = '写入正常：目录可写、读回一致\n' + r.dir
+                log('selftest ok ' + r.dir)
+            } else {
+                const stepName = r.step === 'write' ? '写入失败' : (r.step === 'read' ? '写入成功但读不回来' : '读回内容不一致')
+                this.diagMsg = '自检不通过：' + stepName + '\n' + r.error + '\n' + r.dir
+                log('selftest fail step=' + r.step + ' :: ' + r.error)
+            }
+            this.refreshDiag()
         },
         toggleSaveMode() {
             const next = this.isAutoSave ? 'manual' : 'auto'
@@ -1022,5 +1096,11 @@ export default {
 .st-previewtext {
     font-size: 11px;
     color: #9fe1cb;
+}
+
+/* 诊断区：日志要能整段读，字号压到 9px，允许换行 */
+.st-logtext {
+    font-size: 9px;
+    color: #8f8f9e;
 }
 </style>

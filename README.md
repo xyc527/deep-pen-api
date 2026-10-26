@@ -6,7 +6,7 @@
 
 - 逻辑分辨率 **936 × 280**（横屏小屏）
 - 运行时 QuickJS，Vue 3 SFC，构建产物为 `.amr` 安装包
-- 单测 **368 项断言**（纯函数全部可在 Node 下跑，不需要设备）
+- 单测 **403 项断言**（纯函数全部可在 Node 下跑，不需要设备）
 
 ## 功能
 
@@ -51,6 +51,15 @@
   "今天到底算不算工作日"
 - 主页是否显示余额芯片：「设置 → 账户」里可开关，关掉后连自动查询一起停
 
+**日志与诊断**
+
+- 应用日志落盘在 `$dataDir/deepseek/app.log`（约 24 KB 环形覆盖，错误立刻刷、
+  普通日志攒批 1.5s 刷），带版本号、时间、级别与失败原因；不依赖 `logcat`
+- 每次保存设置都会**写后回读比对**：本机 `fs.writeFile` 有"不报错也不落盘"的
+  实现分支，只看返回值会把"没写进去"当成功
+- 「设置 → 诊断」可查看最近日志、当前版本与数据目录，并有「写入自检」
+  按钮分步验证：建目录 → 写测试文件 → 读回比对，失败时指出卡在哪一步
+
 ## 目录结构
 
 ```
@@ -71,6 +80,9 @@ src/
     holiday.js               节假日数据解析
     uistate.js               跨页面状态广播
     search.js                联网搜索：意图判断、query 构建、结果注入
+    logfile.js               应用日志缓冲（落盘由 platform 注入 sink）
+    savecheck.js             写后读回判定（本机 writeFile 会"不报错也不落盘"）
+    appversion.js            运行时版本号（bump 自动写入）
     chat.js / photos.js / text.js / params.js
   services/                  有副作用的一层
     api.js                   curl 封装：流式补全、搜索、余额、节假日
@@ -82,7 +94,7 @@ scripts/
   build.js                   审计 → 单测 → rollup → qjsc → manifest → amr
   bump.js                    版本号
   audit-text-nesting.js      静态检查 <text> 里是否嵌了元素（会炸进程的那条）
-test/run.mjs                 368 项断言
+test/run.mjs                 403 项断言
 ```
 
 ## 构建

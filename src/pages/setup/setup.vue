@@ -30,11 +30,11 @@
 </template>
 
 <script>
-import { loadSettings, saveSettings } from '../../services/store.js'
+import { loadSettings, saveSettings, getLastSaveInfo } from '../../services/store.js'
 import { openTextEditor } from '../../services/ime.js'
 import { testConnection } from '../../services/api.js'
 import { navTo, log } from '../../services/platform.js'
-import { maskKey, normalizeBaseUrl, isReady } from '../../lib/settings.js'
+import { maskKey, normalizeBaseUrl, isReady, settingsSignature } from '../../lib/settings.js'
 import { publishSettings } from '../../lib/uistate.js'
 
 export default {
@@ -79,10 +79,30 @@ export default {
         applyAndSave(patch) {
             this.settings = Object.assign({}, this.settings, patch || {})
             const saved = saveSettings(this.settings)
-            if (!saved) { this.status = '保存失败：写入配置失败，请重试'; return false }
+            if (!saved) {
+                // 把真实原因带出来（以前只说"写入配置失败"，用户报给我们时无从查起）
+                const info = getLastSaveInfo()
+                this.status = '保存失败：写入配置被拒绝' +
+                    (info.reason && info.reason !== 'unknown' ? '（' + info.reason + '）' : '') +
+                    '，已记入日志'
+                log('setup 保存失败 reason=' + info.reason + ' path=' + info.path)
+                return false
+            }
             this.settings = saved
             publishSettings(saved)
+            this.verifySoon(saved)
             return true
+        },
+        // 本机 writeFile 会"不报错也不落盘"，所以写成功之后还要读回来对一遍
+        verifySoon(expected) {
+            const sig = settingsSignature(expected)
+            setTimeout(async () => {
+                const disk = await loadSettings()
+                if (!disk) return
+                if (settingsSignature(disk) === sig) return
+                this.status = '保存失败：写后读回不一致，已记入日志'
+                log('setup 写后读回不一致')
+            }, 300)
         },
         async editKey() {
             if (!this.settings) { this.status = '配置还在读取，请稍候再点'; return }
@@ -91,7 +111,11 @@ export default {
             const key = String(text).trim()
             if (!this.applyAndSave({ apiKey: key })) return
             const disk = await loadSettings()
-            if (!disk || disk.apiKey !== key) { this.status = '保存失败：磁盘上的 Key 与输入不一致'; return }
+            if (!disk || disk.apiKey !== key) {
+                this.status = '保存失败：读回的值与输入不一致，已记入日志'
+                log('setup verify 不一致 disk=' + (disk ? disk.apiKey.length : -1) + ' want=' + key.length)
+                return
+            }
             this.status = isReady(this.settings) ? '已保存到本机' : 'Key 太短，请检查是否复制完整'
             log('setup key saved len=' + key.length)
         },

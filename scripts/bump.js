@@ -55,5 +55,19 @@ if (fs.existsSync(lockFile)) {
   }
 }
 
+// src/lib/appversion.js：运行期要能打出自己是哪一版（日志里靠它区分用户装的是哪版）
+const verFile = path.resolve(__dirname, '..', 'src', 'lib', 'appversion.js')
+if (fs.existsSync(path.dirname(verFile))) {
+  const content = [
+    '// 应用版本号：由 scripts/bump.js 自动写入，不要手改。',
+    '// 单独放一个文件是因为运行期拿不到 package.json（包里没有），而日志里必须能看出',
+    '// 用户装的是哪一版 —— 否则「0.1.9 有这个问题、0.1.11 修了」这类判断无从谈起。',
+    "export const APP_VERSION = '" + next + "'",
+    ''
+  ].join('\n')
+  fs.writeFileSync(verFile, content)
+  console.log('[bump] appversion.js 已同步')
+}
+
 console.log('[bump] ' + cur + ' → ' + next)
 console.log('[bump] 出包名：' + pkg.appid + '.' + next.replace(/\./g, '_') + '.amr')

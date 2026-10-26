@@ -12,6 +12,10 @@ import { parseHolidayPayload, countHolidayDays, holidaySources } from '../src/li
 import { moneyText, normalizeBalance, balanceLevel, balanceChipText, balanceSplitText, updatedAgo } from '../src/lib/balance.js'
 import { getUiState, setUiState, subscribeUiState, publishSettings } from '../src/lib/uistate.js'
 import { normalizeSearchMode, shouldSearch, buildSearchQuery, parseSearchResults, formatSearchContext, searchSources, hostOf, injectSearchContext } from '../src/lib/search.js'
+import { logLine, setLogSink, logTail, logText, logStats, resetLog, seedLog, flushNow } from '../src/lib/logfile.js'
+import { judgeReadback, readbackHint } from '../src/lib/savecheck.js'
+import { APP_VERSION } from '../src/lib/appversion.js'
+import { readFileSync } from 'fs'
 
 let pass = 0
 let fail = 0
@@ -901,6 +905,107 @@ function searchSuite() {
   eq(scopeOf('searchCount', { searchMode: 'off' }).active, false, '关档时结果数不生效')
   eq(scopeOf('searchCount', { searchMode: 'auto' }).active, true, '自动档时结果数生效')
 }
+
+// ---------- 应用日志 ----------
+function logSuite() {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+
+  // 版本号：日志里靠它区分用户装的是哪一版，bump 漏同步就会对不上
+  eq(APP_VERSION, pkg.version, 'appversion.js 与 package.json 版本一致')
+  ok(/^\d+\.\d+\.\d+$/.test(APP_VERSION), '版本号是三段式')
+
+  resetLog()
+  let got = ''
+  setLogSink((t) => { got = t; return true })
+
+  const L = logLine('E', 'saveSettings 写失败 :: ENOENT')
+  ok(/^\d\d:\d\d:\d\d\.\d\d\d E /.test(L), '日志行带时间与级别', L)
+  ok(L.indexOf('ENOENT') > 0, '日志行保留原因文本')
+  // 错误级立即刷盘
+  ok(got.indexOf('ENOENT') >= 0, '错误级日志立即写入 sink')
+
+  // 普通级走攒批：不立刻刷，但 flushNow 能补上
+  got = ''
+  logLine('I', 'hello')
+  eq(got, '', '普通日志不立即刷盘（攒批）')
+  flushNow()
+  ok(got.indexOf('hello') >= 0, 'flushNow 把攒的内容写出去')
+
+  // 尾部读取
+  resetLog()
+  for (let i = 0; i < 15; i++) logLine('I', 'line-' + i)
+  const tail = logTail(3)
+  eq(tail.split('\n').length, 3, 'logTail 只返回指定行数')
+  ok(tail.indexOf('line-14') > 0, 'logTail 结尾是最新一条')
+  ok(tail.indexOf('line-11') < 0, 'logTail 不含更早的行')
+
+  // 上限：超过 400 行丢最老的，而不是整份清空
+  resetLog()
+  for (let i = 0; i < 460; i++) logLine('I', 'n-' + i)
+  eq(logStats().lines, 400, '超过上限后行数被压在 400')
+  ok(logStats().dropped === 60, '丢弃计数正确')
+  ok(logText().indexOf('n-459') > 0, '最新一条仍在缓冲里')
+  ok(logText().indexOf('n-0\n') < 0, '最老的行已被丢弃')
+
+  // 旧日志回灌要排在前面（本机没有 appendFile，只能读旧+写新）
+  resetLog()
+  seedLog('old-1\nold-2\n')
+  logLine('I', 'new-1')
+  const all = logText()
+  ok(all.indexOf('old-1') === 0, 'seedLog 把旧日志放在最前')
+  ok(all.indexOf('old-2') < all.indexOf('new-1'), '新日志排在旧日志之后')
+
+  // 落盘内容超 24KB 时截断，只保留尾部
+  resetLog()
+  const big = 'x'.repeat(300)
+  for (let i = 0; i < 200; i++) logLine('I', big)
+  let written = ''
+  setLogSink((t) => { written = t; return true })
+  flushNow()
+  ok(written.length <= 24 * 1024 + 1, '落盘文本被截到 24KB 以内', String(written.length))
+  ok(written.indexOf('x'.repeat(300)) > 0, '截断后仍保留整行内容')
+
+  // 没有 sink 时不能抛
+  resetLog()
+  setLogSink(null)
+  eq(flushNow(), false, '无 sink 时 flushNow 返回 false 且不抛')
+  logLine('E', 'no sink still ok')
+  ok(logStats().hasSink === false, 'hasSink 反映真实状态')
+
+  resetLog()
+  eq(logText(), '', 'resetLog 清空缓冲')
+}
+
+logSuite()
+
+// ---------- 写后读回判定 ----------
+function saveCheckSuite() {
+  const txt = '{"apiKey":"sk-xxxxxxxxxxxx"}'
+  eq(judgeReadback(txt, { ok: true, text: txt }).ok, true, '读回一致即成功')
+
+  // 本机 writeFile 会"不报错也不落盘"：读回为空必须判失败，不能因为写返回成功就放过
+  const empty = judgeReadback(txt, { ok: true, text: '' })
+  eq(empty.ok, false, '读回为空判失败')
+  eq(empty.reason, '写后读回为空', '读回为空的原因明确')
+  ok(readbackHint(empty).indexOf('没有落到磁盘') >= 0, '界面提示能说清是没落盘')
+
+  const failedRead = judgeReadback(txt, { ok: false, text: null })
+  eq(failedRead.ok, false, '读失败判失败')
+  eq(failedRead.reason, '写后读回为空', '读失败与空文件同一类原因')
+
+  const diff = judgeReadback(txt, { ok: true, text: txt.slice(0, 10) })
+  eq(diff.ok, false, '读回内容不一致判失败')
+  eq(diff.reason, '写后读回不一致', '不一致的原因明确')
+  eq(diff.wantLen, txt.length, '带上期望长度便于对日志')
+  eq(diff.gotLen, 10, '带上实际长度便于对日志')
+  ok(readbackHint(diff).indexOf('不一致') >= 0, '不一致的提示文案')
+
+  eq(judgeReadback('', { ok: true, text: '' }).ok, false, '空期望 + 空读回也视为失败')
+  eq(readbackHint({ ok: true }), '', '成功时不显示提示')
+  eq(readbackHint(null), '', '空结果不显示提示')
+}
+
+saveCheckSuite()
 
 searchSuite()
 

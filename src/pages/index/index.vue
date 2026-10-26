@@ -153,7 +153,7 @@
 </template>
 
 <script>
-import { loadSettings, saveSettings, loadChats, saveChats, loadPhotoSeen, savePhotoSeen, loadBalance, saveBalance } from '../../services/store.js'
+import { loadSettings, saveSettings, getLastSaveInfo, loadChats, saveChats, loadPhotoSeen, savePhotoSeen, loadBalance, saveBalance } from '../../services/store.js'
 import { sendChat, sendOnce, fetchBalance, searchWeb } from '../../services/api.js'
 import { restoreHoliday, ensureHoliday } from '../../services/holiday.js'
 import { openTextEditor } from '../../services/ime.js'
@@ -650,12 +650,21 @@ export default {
             navTo('settings', {})
         },
 
+        // 首页这两处开关改了要落盘，但写失败时以前是**静默丢掉的**：
+        // 用户点了「思考 关」，界面变了，重启又回来，日志里什么都没有。
+        saveSettingsQuiet(tag) {
+            const saved = saveSettings(this.settings)
+            if (saved) return true
+            const info = getLastSaveInfo()
+            log('index 保存失败 tag=' + tag + ' :: ' + info.reason + ' @ ' + info.path)
+            this.flash('设置没存上：' + (info.reason || '未知原因'))
+            return false
+        },
         toggleThink() {
-
             const p = Object.assign({}, this.settings.params)
             p.thinking = p.thinking === false
             this.settings.params = p
-            saveSettings(this.settings)
+            this.saveSettingsQuiet('think')
         },
         // 三档循环：关 → 自动 → 常开 → 关。
         // 「自动」靠本地规则判断（lib/search.js），零额外请求、零延迟；
@@ -665,7 +674,7 @@ export default {
             const next = cur === 'off' ? 'auto' : (cur === 'auto' ? 'always' : 'off')
             const p = Object.assign({}, this.settings.params, { searchMode: next })
             this.settings = Object.assign({}, this.settings, { params: p })
-            saveSettings(this.settings)
+            this.saveSettingsQuiet('search')
             if (next === 'off') this.flash('联网搜索：关')
             else if (next === 'auto') this.flash('联网搜索：自动（仅在需要时检索）')
             else this.flash('联网搜索：常开（每问必检索，约 0.005 元/次）')

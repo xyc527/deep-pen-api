@@ -1,8 +1,9 @@
 // 持久化：设置 + 会话。全部走文件（本机 storage JSAPI 的 Promise 有挂起风险，
 // 不拿它做关键路径）。
 
-import { readText, writeText, ensureAppDir, joinPath, exists } from './platform.js'
+import { readText, readTextEx, writeText, writeTextEx, ensureAppDir, joinPath, exists, logLine } from './platform.js'
 import { normalizeSettings, DEFAULT_SETTINGS } from '../lib/settings.js'
+import { judgeReadback } from '../lib/savecheck.js'
 import { normalizeBalance } from '../lib/balance.js'
 
 const F_SETTINGS = 'settings.json'
@@ -29,11 +30,76 @@ export async function loadSettings() {
   }
 }
 
+// 最近一次保存的结果。界面拿它显示"到底为什么没存上"，日志拿它留现场。
+// 以前 saveSettings 只返回 null，调用方除了说一句"保存失败"什么都讲不出来。
+let lastSave = { ok: true, reason: '', path: '', at: 0, attempt: 0 }
+
+export function getLastSaveInfo() {
+  return lastSave
+}
+
+function shortErr(s) {
+  const t = String(s || '').replace(/\s+/g, ' ').trim()
+  return t.length > 56 ? t.slice(0, 56) + '…' : (t || 'unknown')
+}
+
 export function saveSettings(settings) {
   const s = normalizeSettings(settings)
   s.updatedAt = Date.now()
-  const ok = writeText(p(F_SETTINGS), JSON.stringify(s))
-  return ok ? s : null
+  const text = JSON.stringify(s)
+  const path = p(F_SETTINGS)
+  let reason = ''
+  // 两轮：首次启动时 mkdir / fs 可能还没就绪，补一次基本能过
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    ensureAppDir()
+    const r = writeTextEx(path, text)
+    if (r.ok) {
+      if (attempt > 1) logLine('W', 'saveSettings 第 ' + attempt + ' 轮才写成功')
+      lastSave = { ok: true, reason: '', path: path, at: s.updatedAt, attempt: attempt }
+      // 本机 writeFile 有"不报错也不落盘"的分支（实测把目标换成目录时就是），
+      // 所以 ok 不等于写成功，必须回读确认。异步做，不拖慢自动保存。
+      scheduleVerify(text, path)
+      return s
+    }
+    reason = r.error
+    logLine('E', 'saveSettings 写失败 第' + attempt + '轮 :: ' + r.error + ' @ ' + path)
+  }
+  lastSave = { ok: false, reason: shortErr(reason), path: path, at: Date.now(), attempt: 2 }
+  return null
+}
+
+// 写后读回：只留一个待执行的校验，连续改动不会堆成一片读
+let verifyPending = false
+function scheduleVerify(expected, path) {
+  if (verifyPending) return
+  verifyPending = true
+  setTimeout(() => {
+    verifyPending = false
+    readTextEx(path, 1).then((r) => {
+      const v = judgeReadback(expected, r)
+      if (!v.ok) {
+        lastSave = { ok: false, reason: v.reason, path: path, at: Date.now(), attempt: 2 }
+        logLine('E', 'saveSettings ' + v.reason +
+          '（len 期望 ' + String(v.wantLen == null ? expected.length : v.wantLen) +
+          ' 实际 ' + String(v.gotLen == null ? 0 : v.gotLen) + '）@ ' + path)
+      }
+    }).catch((e) => {
+      logLine('E', 'saveSettings 读回异常 :: ' + (e && e.message ? e.message : e))
+    })
+  }, 250)
+}
+
+// 写入自检：给设置页「诊断」用，分步告诉用户卡在哪一步（写 / 读 / 内容）
+export async function selfTestWrite() {
+  const dir = ensureAppDir()
+  const file = joinPath(dir, 'selftest.txt')
+  const text = 'ok-' + Date.now()
+  const w = writeTextEx(file, text)
+  if (!w.ok) return { ok: false, step: 'write', error: shortErr(w.error), dir: dir }
+  const r = await readTextEx(file, 2)
+  if (!r.ok) return { ok: false, step: 'read', error: shortErr(r.error), dir: dir }
+  if (String(r.text) !== text) return { ok: false, step: 'compare', error: '写进去的是另一份内容', dir: dir }
+  return { ok: true, step: 'done', error: '', dir: dir }
 }
 
 export async function loadChats() {

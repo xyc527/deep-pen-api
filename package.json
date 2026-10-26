@@ -1,6 +1,6 @@
 {
   "name": "deep-pen-api",
-  "version": "0.1.10",
+  "version": "0.1.13",
   "private": true,
   "description": "DeepSeek 客户端（词典笔 / Falcon 小程序，纯 API 端点模式）",
   "appid": "8000000000182399",

@@ -9,6 +9,7 @@
 
 import fs from 'fs'
 import globalModule from 'global'
+import { logLine, seedLog, setLogSink, flushNow, logText, logTail, logStats } from '../lib/logfile.js'
 
 export const APP_TAG = 'DP'
 
@@ -31,7 +32,11 @@ export function execShell(cmd) {
 }
 
 export function dataDirBase() {
-  try { return String($dataDir || '/tmp').replace(/\/+$/, '') } catch (e) { return '/tmp' }
+  try {
+    // 本机 $dataDir 偶尔带重复斜杠（.../8000000000182399//data），拼出来很难看，
+    // 也容易在日志里误判成"写到了别的目录"
+    return String($dataDir || '/tmp').replace(/\/{2,}/g, '/').replace(/\/+$/, '')
+  } catch (e) { return '/tmp' }
 }
 
 export function joinPath(base) {
@@ -47,19 +52,87 @@ export function appDir() {
   return joinPath(dataDirBase(), 'deepseek')
 }
 
-export function ensureAppDir(sub) {
-  const dir = sub ? joinPath(appDir(), sub) : appDir()
-  try { fs.mkdir(dir) } catch (e) { /* 已存在 */ }
-  return dir
+export function appLogPath() {
+  return joinPath(dataDirBase(), 'deepseek', 'app.log')
 }
 
+export function ensureAppDir(sub) {
+  const dir = sub ? joinPath(appDir(), sub) : appDir()
+  try {
+    fs.mkdir(dir)
+  } catch (e) {
+    // 首次启动最常见：文件系统还没就绪。以前这里静默忽略，然后 writeFile
+    // "不报错也不落盘"，用户看到的就是保存失败/保存后消失，而日志里什么都没有。
+    const msg = e && (e.message || e.name || String(e))
+    if (_mkdirErrOnce !== msg) { _mkdirErrOnce = msg; logLine('W', 'mkdir 失败 ' + dir + ' :: ' + msg) }
+  }
+  return dir
+}
+let _mkdirErrOnce = ''
+
+// 日志落盘：本机没有 appendFile，只能读旧 + 整份重写，所以由 logfile 攒批后调这里
+let _logReady = false
+export async function initLog(version) {
+  if (_logReady) return true
+  _logReady = true
+  // 目录不在时 writeFile 不报错也不落盘（本机特性），所以日志目录要先建好
+  ensureAppDir()
+  setLogSink((text) => {
+    try { fs.writeFile(appLogPath(), text); return true } catch (e) { return false }
+  })
+  // 先落"启动"这一行再 await 读旧日志：否则它会被排到 onLaunch 后续日志的后面，
+  // 日志读起来就成了"先干活，后开机"
+  logLine('I', '--- start v' + String(version || '?') + ' dataDir=' + dataDirBase() + ' ---')
+  try {
+    const old = await fs.readFile(appLogPath())
+    if (old) seedLog(String(old))   // seedLog 会把旧内容插到最前面
+  } catch (e) { /* 首次启动没有旧日志，正常 */ }
+  flushNow()
+  return true
+}
+
+export function logDump() {
+  return { text: logText(), stats: logStats() }
+}
+
+export { logTail, logLine }
+
+// 应用日志：既要能在 logcat 看见（排查时顺手），也要落盘（用户设备上唯一的线索）
 export function log() {
   try {
     const args = []
-    for (let i = 0; i < arguments.length; i++) args.push(arguments[i])
-    console.log(APP_TAG + ' ' + args.join(' '))
+    for (let i = 0; i < arguments.length; i++) {
+      const a = arguments[i]
+      if (a && typeof a === 'object') {
+        try { args.push(JSON.stringify(a)) } catch (e) { args.push(String(a)) }
+      } else args.push(String(a))
+    }
+    const msg = args.join(' ')
+    console.log(APP_TAG + ' ' + msg)
+    logLine('I', msg)
   } catch (e) { /* 忽略 */ }
 }
+
+// 异常统一格式化：把 message / name / errno 都带上，否则日志里只有 "[object Object]"
+export function errText(e) {
+  if (!e) return 'unknown'
+  if (typeof e === 'string') return e
+  const parts = []
+  if (e.name) parts.push(String(e.name))
+  if (e.message) parts.push(String(e.message))
+  if (e.errno !== undefined && e.errno !== null) parts.push('errno=' + e.errno)
+  if (e.code) parts.push('code=' + e.code)
+  const s = parts.join(' ').trim()
+  return s || String(e)
+}
+
+export function logErr(tag, e) {
+  const msg = tag + ' :: ' + errText(e)
+  try { console.log(APP_TAG + ' E ' + msg) } catch (x) { /* 忽略 */ }
+  logLine('E', msg)
+  return msg
+}
+
 
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -71,24 +144,41 @@ export function shq(s) {
 }
 
 export async function readText(path, retries) {
+  const r = await readTextEx(path, retries)
+  return r.ok ? r.text : null
+}
+
+// 带原因的读：以前失败只有 null，分不清"文件不存在"和"文件系统没就绪"，
+// 于是既不敢少重试、也没法在日志里留下证据。
+export async function readTextEx(path, retries) {
   const n = typeof retries === 'number' ? retries : 1
+  let lastErr = ''
   for (let i = 0; i < n; i++) {
     try {
       const v = await fs.readFile(path)
-      if (v !== null && v !== undefined) return String(v)
-    } catch (e) { /* 重试 */ }
+      if (v !== null && v !== undefined) return { ok: true, text: String(v), error: '' }
+      lastErr = 'empty'
+    } catch (e) {
+      lastErr = errText(e)
+    }
     if (i < n - 1) await sleep(400)
   }
-  return null
+  return { ok: false, text: null, error: lastErr }
 }
 
 // 同步写入，故意不返回 Promise：本机 fs.writeFile 是同步实现
 export function writeText(path, text) {
+  return writeTextEx(path, text).ok
+}
+
+// 带原因的写。注意本机一个坑：**目录不存在时 writeFile 不抛错也不落盘**，
+// 所以 ok=true 并不等于真的写进去了 —— 调用方该回读的地方还是要回读。
+export function writeTextEx(path, text) {
   try {
     fs.writeFile(path, String(text == null ? '' : text))
-    return true
+    return { ok: true, error: '' }
   } catch (e) {
-    return false
+    return { ok: false, error: errText(e) }
   }
 }
 
@@ -112,7 +202,14 @@ export async function removeFile(path) {
 }
 
 export async function exists(path) {
-  try { return !!(await fs.exists(path)) } catch (e) { return false }
+  try {
+    const v = await fs.exists(path)
+    // 有固件把 fs.exists 实现成占位对象（返回 {tip:"FileModule.exists"}），
+    // 那是真值 —— 直接 !! 会永远判"存在"，后面读不到又去重试，白等 1.2s。
+    if (typeof v === 'boolean') return v
+  } catch (e) { /* 走兜底 */ }
+  const r = await readTextEx(path, 1)
+  return r.ok
 }
 
 export async function stat(path) {
