@@ -14,6 +14,7 @@ import { getUiState, setUiState, subscribeUiState, publishSettings } from '../sr
 import { normalizeSearchMode, shouldSearch, buildSearchQuery, parseSearchResults, formatSearchContext, searchSources, hostOf, injectSearchContext } from '../src/lib/search.js'
 import { logLine, setLogSink, logTail, logText, logStats, resetLog, seedLog, flushNow } from '../src/lib/logfile.js'
 import { judgeReadback, readbackHint } from '../src/lib/savecheck.js'
+import { normPath, mkdirChain } from '../src/lib/paths.js'
 import { APP_VERSION } from '../src/lib/appversion.js'
 import { readFileSync } from 'fs'
 
@@ -1006,6 +1007,35 @@ function saveCheckSuite() {
 }
 
 saveCheckSuite()
+
+// ---------- 目录逐级创建规划 ----------
+function dirChainSuite() {
+  const base = '/userdisk/secondary/miniapp/data/mini_app/pkg/8000000000182399/data'
+
+  eq(normPath('a//b///'), 'a/b', '归一化合并重复斜杠与尾斜杠')
+  eq(normPath('/'), '/', '根目录不被归一化成空串')
+  eq(normPath(''), '', '空路径保持空串')
+  eq(normPath(null), '', 'null 归一化成空串')
+
+  // 本机 fs.mkdir 只建最后一级，所以中间每一级都得在列表里，顺序由浅到深
+  eq(mkdirChain(base, base + '/deepseek'),
+    [base, base + '/deepseek'], '建 deepseek 要先建 dataDir 本身')
+  eq(mkdirChain(base, base + '/deepseek/tmp'),
+    [base, base + '/deepseek', base + '/deepseek/tmp'], '三级目录逐段建')
+  eq(mkdirChain(base, base), [base], '目标就是 dataDir 时只建它自己')
+  eq(mkdirChain(base, base + '//deepseek///'),
+    [base, base + '/deepseek'], '目标带重复斜杠也能正确拆段')
+
+  // 越权保护：不在 dataDir 之下就不逐段建，免得造出框架不认识的目录
+  eq(mkdirChain(base, '/userdisk/Pictures'), ['/userdisk/Pictures'], 'dataDir 之外只建目标本身')
+  eq(mkdirChain(base, ''), [], '空目标不建任何目录')
+  eq(mkdirChain('', '/tmp/x'), ['/tmp/x'], 'base 为空时退回只建目标')
+
+  // 前缀相同但不是子目录（data2 ≠ data 的子目录），不能误判成子路径
+  eq(mkdirChain('/a/b', '/a/bc'), ['/a/bc'], '前缀相同但不是子目录不逐段建')
+}
+
+dirChainSuite()
 
 searchSuite()
 

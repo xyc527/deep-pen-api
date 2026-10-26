@@ -10,6 +10,7 @@
 import fs from 'fs'
 import globalModule from 'global'
 import { logLine, seedLog, setLogSink, flushNow, logText, logTail, logStats } from '../lib/logfile.js'
+import { mkdirChain } from '../lib/paths.js'
 
 export const APP_TAG = 'DP'
 
@@ -56,15 +57,39 @@ export function appLogPath() {
   return joinPath(dataDirBase(), 'deepseek', 'app.log')
 }
 
+// 建过的目录记一笔：tempDir() 每次请求都会调到这里，逐段 mkdir 每次都重刷一遍系统调用
+// 没必要。写文件抛异常时（writeTextEx 的 catch）会清空缓存，下一轮重试重新逐段建 ——
+// 这也照顾了"目录被外部删掉"的情况。
+let _dirOk = {}
+export function resetDirCache() { _dirOk = {} }
+
+// 目录已存在时 fs.mkdir 也会抛，不能一律当失败，否则每次 ensureAppDir 都记一条假错误
+function isExistErr(msg) {
+  const s = String(msg || '').toLowerCase()
+  return s.indexOf('exist') >= 0 || s.indexOf('errno=17') >= 0
+}
+
 export function ensureAppDir(sub) {
   const dir = sub ? joinPath(appDir(), sub) : appDir()
-  try {
-    fs.mkdir(dir)
-  } catch (e) {
+  if (_dirOk[dir]) return dir
+  // 从 dataDir 起逐段建：父链缺任何一级，单次 mkdir 都会 ENOENT，
+  // 而 writeFile 又"不报错也不落盘"，结果就是日志静默丢失（真机上复现过）
+  const list = mkdirChain(dataDirBase(), dir)
+  let lastErr = ''
+  for (let i = 0; i < list.length; i++) {
+    try {
+      fs.mkdir(list[i])
+    } catch (e) {
+      const msg = errText(e)
+      if (!isExistErr(msg)) lastErr = list[i] + ' :: ' + msg
+    }
+  }
+  if (lastErr) {
     // 首次启动最常见：文件系统还没就绪。以前这里静默忽略，然后 writeFile
     // "不报错也不落盘"，用户看到的就是保存失败/保存后消失，而日志里什么都没有。
-    const msg = e && (e.message || e.name || String(e))
-    if (_mkdirErrOnce !== msg) { _mkdirErrOnce = msg; logLine('W', 'mkdir 失败 ' + dir + ' :: ' + msg) }
+    if (_mkdirErrOnce !== lastErr) { _mkdirErrOnce = lastErr; logLine('W', 'mkdir 失败 ' + lastErr) }
+  } else {
+    _dirOk[dir] = 1
   }
   return dir
 }
@@ -178,6 +203,9 @@ export function writeTextEx(path, text) {
     fs.writeFile(path, String(text == null ? '' : text))
     return { ok: true, error: '' }
   } catch (e) {
+    // 写失败常见原因是目录没了（被清理、被换掉）。清掉缓存，下一次 ensureAppDir
+    // 会重新逐段建，而不是因为"记着建过"直接跳过。
+    _dirOk = {}
     return { ok: false, error: errText(e) }
   }
 }
