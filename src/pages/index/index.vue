@@ -33,8 +33,8 @@
                 <div v-if="m.sources && m.sources.length" class="ix-srcs" @click="toggleSources(m)">
                     <text class="ix-srctxt">{{ sourcesLabel(m) }}</text>
                 </div>
-                <div v-if="m.sources && m.sources.length && srcOpen(m.id)" class="ix-srclist">
-                    <text v-for="(s, si) in m.sources" :key="si" class="ix-srcitem">{{ (si + 1) + '. ' + s.title + (s.host ? '（' + s.host + '）' : '') }}</text>
+                <div v-if="m.sources && m.sources.length && srcOpen(m)" class="ix-srclist">
+                    <text v-for="(s, si) in m.sources" :key="si" class="ix-srcitem">{{ srcLine(s, si) }}</text>
                 </div>
 
                 <!-- 思考过程（可折叠） -->
@@ -168,7 +168,7 @@ import { addPhoto, removePhoto, diffNewPhotos, formatSize } from '../../lib/phot
 import { billingPeriod, setTimeSkew, nowMs } from '../../lib/peak.js'
 import { balanceChipText, balanceLevel } from '../../lib/balance.js'
 import { setUiState, subscribeUiState, getUiState } from '../../lib/uistate.js'
-import { normalizeSearchMode, shouldSearch, buildSearchQuery, formatSearchContext, searchSources, injectSearchContext } from '../../lib/search.js'
+import { normalizeSearchMode, shouldSearch, buildSearchQuery, formatSearchContext, searchSources, injectSearchContext, sourceLine } from '../../lib/search.js'
 
 const MAX_IMAGES = 4
 
@@ -177,6 +177,13 @@ const planCache = {}
 const reasonOpenSet = {}
 // 联网来源的展开状态（同样放模块作用域）
 const srcOpenSet = {}
+// 展开状态一律按消息 id 记账；调用方传消息对象或 id 都能拿到同一个 key。
+// （模板里 v-if 曾写成 srcOpen(m.id)，而方法取的是 m.id → undefined，恒为 false：
+//   标签能变 ▲，列表却永远不出现。）
+function openKey(m) {
+    if (m && typeof m === 'object') return String(m.id)
+    return String(m)
+}
 // 流式节流用的临时表（放模块作用域，避免写 data 触发额外重渲染）
 const streamBuf = {}
 const streamTimers = {}
@@ -252,6 +259,10 @@ export default {
         },
         searchMode() {
             return normalizeSearchMode(this.settings && this.settings.params.searchMode)
+        },
+        // 来源展开后的显示方式：设置里选「全部」→ 完整标题（可折行）
+        srcFull() {
+            return !!(this.settings && this.settings.sourceStyle === 'full')
         },
         searchTxtClass() {
             return this.searchMode === 'off' ? 'ix-chiptxt' : 'ix-chiptxt-on'
@@ -961,22 +972,27 @@ export default {
             return this.reasonOpen(m) ? '收起' : '思考过程'
         },
         reasonOpen(m) {
-            return reasonOpenSet[m.id] === true
+            return reasonOpenSet[openKey(m)] === true
         },
         toggleReason(m) {
-            reasonOpenSet[m.id] = !this.reasonOpen(m)
+            reasonOpenSet[openKey(m)] = !this.reasonOpen(m)
             this.$forceUpdate()
         },
         // 联网来源：默认收起，展开看标题。和「思考过程」同一套开关方式
         srcOpen(m) {
-            return srcOpenSet[m.id] === true
+            return srcOpenSet[openKey(m)] === true
         },
         sourcesLabel(m) {
             const n = (m.sources || []).length
             return '已联网 · ' + n + ' 条来源' + (this.srcOpen(m) ? ' ▲' : ' ▼')
         },
+        // 一条来源一行：默认标题截成一行 + 域名；设置里选「全部」就显示完整标题（自动折行）。
+        // 拼装逻辑在 lib/search.js，有单测。
+        srcLine(s, si) {
+            return sourceLine(s, si, this.srcFull)
+        },
         toggleSources(m) {
-            srcOpenSet[m.id] = !this.srcOpen(m)
+            srcOpenSet[openKey(m)] = !this.srcOpen(m)
             this.$forceUpdate()
         },
         convRowStyle(c) {

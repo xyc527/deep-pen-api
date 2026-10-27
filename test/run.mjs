@@ -11,10 +11,11 @@ import { billingPeriod, isHoliday, formatRemain, describePeriod, holidayTableYea
 import { parseHolidayPayload, countHolidayDays, holidaySources } from '../src/lib/holiday.js'
 import { moneyText, normalizeBalance, balanceLevel, balanceChipText, balanceSplitText, updatedAgo } from '../src/lib/balance.js'
 import { getUiState, setUiState, subscribeUiState, publishSettings } from '../src/lib/uistate.js'
-import { normalizeSearchMode, shouldSearch, buildSearchQuery, parseSearchResults, formatSearchContext, searchSources, hostOf, injectSearchContext } from '../src/lib/search.js'
+import { normalizeSearchMode, shouldSearch, buildSearchQuery, parseSearchResults, formatSearchContext, searchSources, hostOf, injectSearchContext, sourceLine } from '../src/lib/search.js'
 import { logLine, setLogSink, logTail, logText, logStats, resetLog, seedLog, flushNow } from '../src/lib/logfile.js'
 import { judgeReadback, readbackHint } from '../src/lib/savecheck.js'
 import { normPath, mkdirChain } from '../src/lib/paths.js'
+import { planWrites, describeWriteFail, WRITE_ORDER } from '../src/lib/writeplan.js'
 import { APP_VERSION } from '../src/lib/appversion.js'
 import { readFileSync } from 'fs'
 
@@ -905,6 +906,26 @@ function searchSuite() {
   // 搜索结果数在关档时置灰
   eq(scopeOf('searchCount', { searchMode: 'off' }).active, false, '关档时结果数不生效')
   eq(scopeOf('searchCount', { searchMode: 'auto' }).active, true, '自动档时结果数生效')
+
+  // 展开后的来源行：编号从 1 起、标题太长截断、域名跟在后面
+  eq(sourceLine({ title: '短标题', host: 'a.com' }, 0), '1. 短标题（a.com）', '来源行：编号+标题+域名')
+  eq(sourceLine({ title: '短标题' }, 2), '3. 短标题', '来源行：没有域名就不加括号')
+  eq(sourceLine({}, 0), '1. （无标题）', '来源行：无标题有兜底')
+  const longT = '快讯：近期，国际金价大幅震荡。COMEX黄金上周跌幅达到4%'
+  eq(sourceLine({ title: longT, host: 'x.com' }, 0).length <= 26 + 3 + 12, true, '来源行：长标题被截断')
+  ok(sourceLine({ title: longT }, 0).indexOf('…') > 0, '来源行：截断处有省略号')
+  eq(sourceLine({ title: '  多个   空格  ' }, 0), '1. 多个 空格', '来源行：空白折叠')
+
+  // 设置里选「全部」→ 不截断，交给 <text> 自己折行
+  eq(sourceLine({ title: longT, host: 'x.com' }, 0, true),
+    '1. ' + longT + '（x.com）', '来源行：全部模式保留完整标题')
+  ok(sourceLine({ title: longT }, 0, true).indexOf('…') < 0, '来源行：全部模式不加省略号')
+  eq(sourceLine({ title: longT }, 0, false), sourceLine({ title: longT }, 0), '来源行：单行模式与默认一致')
+
+  // 设置项：只认 full，其它一律单行（老配置没有这个字段）
+  eq(normalizeSettings({}).sourceStyle, 'single', 'sourceStyle 缺省 → 单行')
+  eq(normalizeSettings({ sourceStyle: 'full' }).sourceStyle, 'full', 'sourceStyle 保留 full')
+  eq(normalizeSettings({ sourceStyle: 'bogus' }).sourceStyle, 'single', 'sourceStyle 非法值 → 单行')
 }
 
 // ---------- 应用日志 ----------
@@ -1035,7 +1056,42 @@ function dirChainSuite() {
   eq(mkdirChain('/a/b', '/a/bc'), ['/a/bc'], '前缀相同但不是子目录不逐段建')
 }
 
+function writePlanSuite() {
+  // 这条链的由来：fs.writeFile 并非所有固件都有（文档里的 fs 根本没写这个方法），
+  // 缺了就是 "TypeError: not a function"，保存全挂、日志也写不进。所以按顺序兜底。
+
+  eq(WRITE_ORDER, ['fs.writeFile', 'fs.writeFileSync', 'shell'], '候选顺序固定')
+
+  // 三样都有 → 按优先级全排上
+  eq(planWrites({ 'fs.writeFile': true, 'fs.writeFileSync': true, shell: true }, ''),
+    ['fs.writeFile', 'fs.writeFileSync', 'shell'], '都有时按优先级排')
+
+  // 目标机型：没有 writeFile / writeFileSync，只剩 shell
+  eq(planWrites({ shell: true }, ''), ['shell'], '只有 execShell 时兜底到 shell')
+
+  // 上一轮成功过的通道排最前（省掉每次重试失败的调用）
+  eq(planWrites({ 'fs.writeFile': true, shell: true }, 'shell'),
+    ['shell', 'fs.writeFile'], '上次成功的通道优先')
+
+  // 缓存里记的通道这次不存在了 → 忽略，别把不存在的东西排进列表
+  eq(planWrites({ shell: true }, 'fs.writeFile'), ['shell'], '缓存通道消失了就不排它')
+  eq(planWrites({ 'fs.writeFile': true }, 'unix.write'), ['fs.writeFile'], '不认识的通道名被忽略')
+
+  // 什么都不具备 → 空列表（调用方拿到空计划时直接判失败，不要再瞎调）
+  eq(planWrites({}, ''), [], '没有任何通道时返回空计划')
+  eq(planWrites(null, ''), [], 'available 为空也返回空计划')
+
+  // 失败信息：一条也能读，多条用 | 拼
+  ok(describeWriteFail([]).indexOf('没有可用') >= 0, '无失败记录时给出总括')
+  eq(describeWriteFail([{ backend: 'fs.writeFile', error: 'not a function' }]),
+    'fs.writeFile :: not a function', '单条失败信息带通道名')
+  eq(describeWriteFail([{ backend: 'fs.writeFile', error: 'x' }, { backend: 'shell', error: 'y' }]),
+    'fs.writeFile :: x | shell :: y', '多条失败信息按顺序拼接')
+}
+
 dirChainSuite()
+
+writePlanSuite()
 
 searchSuite()
 

@@ -17,6 +17,9 @@ export const DEFAULT_SETTINGS = {
   // 主页顶栏是否显示「余额 + 峰谷」芯片。关掉只是不显示、也不再定时查余额，
   // 设置页「账户」里的余额/时段照常可查
   showBalance: true,
+  // 展开「N 条来源」后怎么显示：'single' 标题截成一行（默认，正文不被挤走）；
+  // 'full' 显示完整标题（长的会自动折行）。搜索结果标题长度差很多，交给用户自己选
+  sourceStyle: 'single',
   // 保存方式：'auto' 改一项存一项；'manual' 只在点顶部「保存」时落盘。
   // 两者互斥 —— manual 下所有改动只留在内存，顶部才会出现保存按钮
   saveMode: 'auto',
@@ -55,6 +58,8 @@ export function normalizeSettings(raw) {
     showBalance: src.showBalance === false ? false : true,
     // 只认 'manual'，其它一律按自动保存（老配置没有这个字段 → 自动保存）
     saveMode: src.saveMode === 'manual' ? 'manual' : 'auto',
+    // 只认 'full'，其它一律单行（老配置没有这个字段 → 单行）
+    sourceStyle: src.sourceStyle === 'full' ? 'full' : 'single',
     params: Object.assign({}, defaultParams(), src.params && typeof src.params === 'object' ? src.params : {}),
     updatedAt: Number(src.updatedAt) || 0
   }

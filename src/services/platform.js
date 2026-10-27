@@ -10,6 +10,7 @@
 import fs from 'fs'
 import globalModule from 'global'
 import { logLine, seedLog, setLogSink, flushNow, logText, logTail, logStats } from '../lib/logfile.js'
+import { planWrites, describeWriteFail } from '../lib/writeplan.js'
 import { mkdirChain } from '../lib/paths.js'
 
 export const APP_TAG = 'DP'
@@ -102,12 +103,13 @@ export async function initLog(version) {
   _logReady = true
   // 目录不在时 writeFile 不报错也不落盘（本机特性），所以日志目录要先建好
   ensureAppDir()
-  setLogSink((text) => {
-    try { fs.writeFile(appLogPath(), text); return true } catch (e) { return false }
-  })
+  setLogSink((text) => writeTextEx(appLogPath(), text).ok)
   // 先落"启动"这一行再 await 读旧日志：否则它会被排到 onLaunch 后续日志的后面，
   // 日志读起来就成了"先干活，后开机"
   logLine('I', '--- start v' + String(version || '?') + ' dataDir=' + dataDirBase() + ' ---')
+  // 环境自检一行：机型 / 框架版本 / 写文件通道 / fs 暴露了哪些方法。
+  // 换机型出问题时，这一行就能直接看出"写不进去"是缺 API 还是别的原因。
+  logLine('I', 'env ' + envDump())
   try {
     const old = await fs.readFile(appLogPath())
     if (old) seedLog(String(old))   // seedLog 会把旧内容插到最前面
@@ -191,6 +193,100 @@ export async function readTextEx(path, retries) {
   return { ok: false, text: null, error: lastErr }
 }
 
+// ---------- 写文件：多后端兜底 ----------
+// 文档里的 fs（限本应用 data 目录）只列了 readdir / stat / exists / readFile / mkdir / rm，
+// **没有 writeFile**。X7 的固件额外带了这个方法，所以开发机上一直好用；换机型 / 换固件
+// 它就是 undefined，调用当场 "TypeError: not a function"，用户看到的是
+// "保存失败：写入被拒绝"，而 app.log 一起写不进去 —— 等于现场没有任何线索。
+// 所以写操作按顺序挑一个真能用的通道，并把结果记进日志（env 那一行）。
+let _writeBackend = ''
+let _writeLogged = ''
+
+// 这台设备上到底有哪几条通道（探测一次，结果不缓存：通道状态可能随环境变化）
+function availableWrites() {
+  const av = {}
+  try {
+    if (fs && typeof fs.writeFile === 'function') av['fs.writeFile'] = true
+    if (fs && typeof fs.writeFileSync === 'function') av['fs.writeFileSync'] = true
+  } catch (e) { /* fs 本身异常，只剩 shell */ }
+  const g = getGlobal()
+  if (g && typeof g.execShell === 'function') av.shell = true
+  return av
+}
+
+export function writeBackend() {
+  if (_writeBackend) return _writeBackend
+  const list = planWrites(availableWrites(), '')
+  return list.length ? list[0] : ''
+}
+
+function detectWriteBackend() {
+  return writeBackend()
+}
+
+function fsApiKeys() {
+  const out = []
+  try {
+    for (const k in fs) out.push(k)
+  } catch (e) { /* 宿主对象可能不可枚举 */ }
+  try {
+    const names = Object.getOwnPropertyNames(fs)
+    for (let i = 0; i < names.length; i++) if (out.indexOf(names[i]) < 0) out.push(names[i])
+  } catch (e) { /* 忽略 */ }
+  return out
+}
+
+// 一行环境摘要，进日志用。字段都用短名：屏幕窄，日志也短。
+export function envDump() {
+  const o = { write: detectWriteBackend() || '-' }
+  try { o.model = String($falcon.env.deviceModel || '') } catch (e) { /* 无 $falcon */ }
+  try { o.ui = String($falcon.env.version || '') } catch (e) { /* 忽略 */ }
+  try { o.api = String($falcon.env.apiVersion || '') } catch (e) { /* 忽略 */ }
+  try { o.wh = String($falcon.env.deviceWidth || '') + 'x' + String($falcon.env.deviceHeight || '') } catch (e) { /* 忽略 */ }
+  const keys = fsApiKeys()
+  o.fs = keys.length ? keys.join(',') : '-'
+  try { return JSON.stringify(o) } catch (e) { return 'write=' + o.write }
+}
+
+// shell 通道：printf 不做转义解析，内容原样落盘；单引号交给 shq 处理。
+// 缺点是要把内容塞进命令行，超大文件会撞 ARG_MAX —— 目前最大的是 chats.json（几十 KB），
+// 离上限还很远。
+function writeViaShell(path, text) {
+  const g = getGlobal()
+  if (!g || typeof g.execShell !== 'function') return { ok: false, error: 'execShell 不可用' }
+  try {
+    const ret = g.execShell('printf %s ' + shq(text) + ' > ' + shq(path))
+    // 本固件 execShell 返回 boolean；false 说明命令没跑起来，产物是否落盘仍靠回读确认
+    if (ret === false) return { ok: false, error: 'execShell 返回 false' }
+    return { ok: true, error: '' }
+  } catch (e) {
+    return { ok: false, error: errText(e) }
+  }
+}
+
+function callFsWrite(fn) {
+  try {
+    fn()
+    return { ok: true, error: '' }
+  } catch (e) {
+    return { ok: false, error: errText(e) }
+  }
+}
+
+// 返回 null 表示这条通道在这台设备上不存在
+function runWrite(backend, path, text) {
+  if (backend === 'fs.writeFile') {
+    if (typeof fs.writeFile !== 'function') return null
+    return callFsWrite(() => fs.writeFile(path, text))
+  }
+  if (backend === 'fs.writeFileSync') {
+    if (typeof fs.writeFileSync !== 'function') return null
+    return callFsWrite(() => fs.writeFileSync(path, text))
+  }
+  if (backend === 'shell') return writeViaShell(path, text)
+  return null
+}
+
 // 同步写入，故意不返回 Promise：本机 fs.writeFile 是同步实现
 export function writeText(path, text) {
   return writeTextEx(path, text).ok
@@ -199,24 +295,32 @@ export function writeText(path, text) {
 // 带原因的写。注意本机一个坑：**目录不存在时 writeFile 不抛错也不落盘**，
 // 所以 ok=true 并不等于真的写进去了 —— 调用方该回读的地方还是要回读。
 export function writeTextEx(path, text) {
-  try {
-    fs.writeFile(path, String(text == null ? '' : text))
-    return { ok: true, error: '' }
-  } catch (e) {
-    // 写失败常见原因是目录没了（被清理、被换掉）。清掉缓存，下一次 ensureAppDir
-    // 会重新逐段建，而不是因为"记着建过"直接跳过。
-    _dirOk = {}
-    return { ok: false, error: errText(e) }
+  const s = String(text == null ? '' : text)
+  const order = planWrites(availableWrites(), _writeBackend)
+  const fails = []
+  for (let i = 0; i < order.length; i++) {
+    const b = order[i]
+    const r = runWrite(b, path, s)
+    if (!r) { fails.push({ backend: b, error: '不可用' }); continue }
+    if (r.ok) {
+      if (_writeBackend !== b) _writeBackend = b
+      if (!_writeLogged) {
+        _writeLogged = b
+        // 只在通道首次确定时记一次，避免刷屏（这条本身走日志缓冲，不会递归）
+        if (i > 0) logLine('W', '写文件通道切到 ' + b + '（首选不可用）')
+      }
+      return { ok: true, error: '' }
+    }
+    fails.push({ backend: b, error: r.error })
   }
+  // 写失败常见原因是目录没了（被清理、被换掉）。清掉缓存，下一次 ensureAppDir
+  // 会重新逐段建，而不是因为"记着建过"直接跳过。
+  _dirOk = {}
+  return { ok: false, error: describeWriteFail(fails) }
 }
 
 export function writeFileSync(path, data) {
-  try {
-    fs.writeFile(path, data)
-    return true
-  } catch (e) {
-    return false
-  }
+  return writeTextEx(path, String(data == null ? '' : data)).ok
 }
 
 export async function removeFile(path) {

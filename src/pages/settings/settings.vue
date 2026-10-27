@@ -57,6 +57,15 @@
                     </div>
                     <text class="st-doc">{{ showBalDoc }}</text>
                 </div>
+                <!-- 来源展开后一行一条还是完整标题：搜索结果标题长度差很多，交给用户选 -->
+                <div class="st-row" @click="toggleSourceStyle">
+                    <text class="st-label">来源展开</text>
+                    <div class="st-ctl">
+                        <div :class="!srcFullOn ? 'st-opt-on' : 'st-opt'"><text :class="!srcFullOn ? 'st-opttxt-on' : 'st-opttxt'">单行</text></div>
+                        <div :class="srcFullOn ? 'st-opt-on' : 'st-opt'"><text :class="srcFullOn ? 'st-opttxt-on' : 'st-opttxt'">全部</text></div>
+                    </div>
+                    <text class="st-doc">{{ srcStyleDoc }}</text>
+                </div>
                 <div class="st-row">
                     <text class="st-label">计费时段</text>
                     <text :class="periodClass">{{ periodText }}</text>
@@ -150,6 +159,12 @@
                     <div class="st-ctl"><text class="st-text">{{ appVer }}</text></div>
                     <text class="st-doc">数据目录 {{ dataDir }}</text>
                 </div>
+                <!-- 不同机型/固件暴露的文件接口不一样，写不进去时这一行能直接定性 -->
+                <div class="st-row">
+                    <text class="st-label">写入通道</text>
+                    <div class="st-ctl"><text class="st-text">{{ writeChan }}</text></div>
+                    <text class="st-doc">fs.writeFile / writeFileSync / shell，自动挑可用的</text>
+                </div>
                 <div class="st-row">
                     <text class="st-label">日志</text>
                     <div class="st-btn2" @click="refreshDiag"><text class="st-btn2txt">刷新</text></div>
@@ -169,7 +184,7 @@
 <script>
 import { loadSettings, saveSettings, loadBalance as loadBalanceCache, saveBalance, selfTestWrite, getLastSaveInfo } from '../../services/store.js'
 import { openTextEditor } from '../../services/ime.js'
-import { navTo, deviceInfo, log, logTail, appDir } from '../../services/platform.js'
+import { navTo, deviceInfo, log, logTail, appDir, writeBackend } from '../../services/platform.js'
 import { APP_VERSION } from '../../lib/appversion.js'
 import { listModels, testConnection, fetchBalance } from '../../services/api.js'
 import { PARAMS, PARAM_MAP, defaultParams, clampNumber, buildBody, describeBody, modelOptions } from '../../lib/params.js'
@@ -224,6 +239,10 @@ export default {
         }
     },
     computed: {
+        // 诊断区展示"这次到底走的哪条写入通道"，出问题时用户截图就够定位
+        writeChan() {
+            return writeBackend() || '无可用接口'
+        },
         keyText() {
             const k = this.settings ? this.settings.apiKey : ''
             return k ? maskKey(k) : '（未填写，点击输入）'
@@ -293,6 +312,14 @@ export default {
             return this.showBalOn
                 ? '点这一行切换；顶栏显示余额与峰谷，点芯片强刷，后台每 5 分钟查一次'
                 : '点这一行切换；顶栏不显示，也停止自动查余额（本页数据照常可查）'
+        },
+        srcFullOn() {
+            return !!(this.settings && this.settings.sourceStyle === 'full')
+        },
+        srcStyleDoc() {
+            return this.srcFullOn
+                ? '点这一行切换；完整标题，长标题会折行，占地方但看得全'
+                : '点这一行切换；标题截成一行，条目多时也不挡正文'
         },
         periodText() {
             const p = this.period
@@ -471,6 +498,12 @@ export default {
             // 广播交给 persist()：手动保存模式下，开关改动要等点「保存」才对首页生效
             this.apply({ showBalance: next })
             log('showBalance ' + next)
+        },
+        // 单行 / 全部 二选一，走同一个 apply()：自动模式立刻落盘并广播到首页
+        toggleSourceStyle() {
+            const next = this.srcFullOn ? 'single' : 'full'
+            this.apply({ sourceStyle: next })
+            log('sourceStyle ' + next)
         },
 
         // 余额：GET /user/balance（官方接口）。顺带用响应头 Date 校准设备时钟 ——

@@ -160,3 +160,15 @@ export function injectSearchContext(messages, context) {
   list.splice(at, 0, { role: 'system', content: context })
   return list
 }
+
+// 来源列表的一行文本：「1. 标题（域名）」。
+// 搜索结果标题动辄七八十字，这个屏一行只放得下 ~40 个汉字，原样铺开会把正文挤没，
+// 所以默认截断到 26 字；full=true 时保留完整标题（让 <text> 自己折行）。
+// 纯函数，便于单测。
+export function sourceLine(s, i, full) {
+  const src = s || {}
+  const t = String(src.title || '').replace(/\s+/g, ' ').trim()
+  const short = !full && t.length > 26 ? t.slice(0, 26) + '…' : t
+  const host = src.host ? '（' + src.host + '）' : ''
+  return String((Number(i) || 0) + 1) + '. ' + (short || '（无标题）') + host
+}
