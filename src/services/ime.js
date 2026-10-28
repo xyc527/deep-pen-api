@@ -11,7 +11,29 @@
 // 这条路不需要 native C++ 扩展 —— 参考仓库里 templates/jsapi 的 KeyInput/KeyCodes
 // 是"往应用内注入按键事件"的 native 能力，跟"拉起系统输入法"是两件事，这里用不上。
 
-import { getGlobal, log } from './platform.js'
+import { getGlobal, log, execShell } from './platform.js'
+
+// 键盘左下角「中/英」键的位置：逻辑坐标 (50,234)。
+// 触摸面板是竖屏原生坐标：x_raw = 逻辑y，y_raw = 935 - 逻辑x。
+const ZH_KEY_RAW_X = 234
+const ZH_KEY_RAW_Y = 885
+
+// 这个固件的输入法**不认** startTextEdit 里的 ZhCNPreferred / inputType / ZhCNOnly
+// （逐个实测过，键盘一律英文起步）。唯一可靠的开关就是界面上那个「中/英」键，
+// 所以唤起之后替用户点一下。延迟 700ms 是为了等键盘页真正铺上来：这时点击落点是
+// 输入页自己（我们的页面在下面），不会误触到底栏按钮。
+function tapZhKey() {
+  try {
+    const cmd = '/bin/send_event touch press ' + ZH_KEY_RAW_X + ' ' + ZH_KEY_RAW_Y +
+      '; sleep 0.15; /bin/send_event touch release ' + ZH_KEY_RAW_X + ' ' + ZH_KEY_RAW_Y
+    const r = execShell(cmd)
+    log('IME 自动切中文 ' + (r === false ? '命令未执行' : 'ok'))
+  } catch (e) {
+    log('IME 自动切中文异常 ' + e)
+  }
+}
+
+
 
 // IME 回传结果里的文本字段名（不同固件/语音形态不同，逐个兜底）
 const TEXT_KEYS = ['contents', 'jsonData', 'text', 'inputText', 'currentText', 'content', 'data', 'result', 'value', 'textContent', 'editContent']
@@ -124,11 +146,16 @@ export function openTextEditor(initialText, options) {
         text: text,
         contents: text
       }
+      // 这一行只是"按 SDK 语义"把中文优先传下去，本固件**不认**它（实测 ZhCNPreferred /
+      // inputType / ZhCNOnly 全都无效，键盘一律英文起步），真正起作用的是下面的 tapZhKey。
+      // 需要中文输入的调用方传 zhCN: true，其余（Key、网址、停止词）保持英文键盘。
+      config.ZhCNPreferred = opts.zhCN === true
       // inputType 是 SDK 里的枚举，本工程不依赖 SDK；留空则不传，由输入法取默认。
       if (opts.inputType !== undefined && opts.inputType !== null && opts.inputType !== '') {
         config.inputType = opts.inputType
       }
       g.startTextEdit(JSON.stringify(config))
+      if (opts.zhCN === true) setTimeout(tapZhKey, 700)
     } catch (e) {
       log('startTextEdit 失败 ' + e)
       settle([])

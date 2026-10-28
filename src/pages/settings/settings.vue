@@ -166,6 +166,11 @@
                     <text class="st-doc">fs.writeFile / writeFileSync / shell，自动挑可用的</text>
                 </div>
                 <div class="st-row">
+                    <text class="st-label">宿主存储</text>
+                    <div class="st-ctl"><text class="st-text">{{ storeChan }}</text></div>
+                    <text class="st-doc">jsapi.storage；设置与会话也写这份，文件坏了从这里恢复</text>
+                </div>
+                <div class="st-row">
                     <text class="st-label">日志</text>
                     <div class="st-btn2" @click="refreshDiag"><text class="st-btn2txt">刷新</text></div>
                     <text class="st-doc">最近 10 行，存在同目录 app.log</text>
@@ -185,6 +190,7 @@
 import { loadSettings, saveSettings, loadBalance as loadBalanceCache, saveBalance, selfTestWrite, getLastSaveInfo } from '../../services/store.js'
 import { openTextEditor } from '../../services/ime.js'
 import { navTo, deviceInfo, log, logTail, appDir, writeBackend } from '../../services/platform.js'
+import { storageKind, storageSelfTest } from '../../services/storage.js'
 import { APP_VERSION } from '../../lib/appversion.js'
 import { listModels, testConnection, fetchBalance } from '../../services/api.js'
 import { PARAMS, PARAM_MAP, defaultParams, clampNumber, buildBody, describeBody, modelOptions } from '../../lib/params.js'
@@ -231,6 +237,7 @@ export default {
             // 诊断
             appVer: APP_VERSION,
             dataDir: '',
+            storeChan: '',
             diagBusy: false,
             diagMsg: '',
             logTailText: '',
@@ -629,21 +636,25 @@ export default {
         refreshDiag() {
             this.logTailText = logTail(10) || '(日志为空)'
             this.dataDir = appDir()
+            this.storeChan = storageKind()
         },
         async runSelfTest() {
             if (this.diagBusy) return
             this.diagBusy = true
             this.diagMsg = '正在自检…'
             const r = await selfTestWrite()
+            // 两条通道都测：文件坏了但 storage 好，数据照样不会丢
+            const st = await storageSelfTest()
             this.diagBusy = false
-            if (r.ok) {
-                this.diagMsg = '写入正常：目录可写、读回一致\n' + r.dir
-                log('selftest ok ' + r.dir)
-            } else {
-                const stepName = r.step === 'write' ? '写入失败' : (r.step === 'read' ? '写入成功但读不回来' : '读回内容不一致')
-                this.diagMsg = '自检不通过：' + stepName + '\n' + r.error + '\n' + r.dir
-                log('selftest fail step=' + r.step + ' :: ' + r.error)
-            }
+            const fileText = r.ok
+                ? '文件：可写、读回一致'
+                : ('文件：' + (r.step === 'write' ? '写入失败' : (r.step === 'read' ? '写入成功但读不回来' : '读回内容不一致')) + ' \n' + r.error)
+            const stText = st.ok
+                ? ('宿主存储：' + st.kind + ' 读写一致')
+                : ('宿主存储：' + (st.kind === 'none' ? '不可用（该固件没有 jsapi.storage）' : st.error))
+            this.diagMsg = fileText + '\n' + stText + '\n' + r.dir
+            if (r.ok || st.ok) log('selftest ok file=' + (r.ok ? '1' : '0') + ' store=' + (st.ok ? '1' : '0'))
+            else log('selftest fail file=' + r.step + ' :: ' + r.error + ' | store=' + st.step + ' :: ' + st.error)
             this.refreshDiag()
         },
         toggleSaveMode() {
@@ -798,7 +809,7 @@ export default {
         },
         async editSystem() {
             if (!this.settings) { this.connStatus = '配置还在读取，请稍候再点'; return }
-            const text = await openTextEditor(this.settings.systemPrompt || '', { multiLine: true, confirmText: '完成', maxlength: 1200 })
+            const text = await openTextEditor(this.settings.systemPrompt || '', { multiLine: true, confirmText: '完成', maxlength: 1200, zhCN: true })
             if (text === null || text === undefined) return
             this.apply({ systemPrompt: String(text) })
         },

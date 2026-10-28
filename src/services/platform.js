@@ -12,6 +12,7 @@ import globalModule from 'global'
 import { logLine, seedLog, setLogSink, flushNow, logText, logTail, logStats } from '../lib/logfile.js'
 import { planWrites, describeWriteFail } from '../lib/writeplan.js'
 import { mkdirChain } from '../lib/paths.js'
+import { storageKind, storageApiNames } from './storage.js'
 
 export const APP_TAG = 'DP'
 
@@ -239,6 +240,12 @@ function fsApiKeys() {
 // 一行环境摘要，进日志用。字段都用短名：屏幕窄，日志也短。
 export function envDump() {
   const o = { write: detectWriteBackend() || '-' }
+  // 宿主 storage 通道：none 表示这固件没有 jsapi.storage（那设置/会话只能靠文件）
+  try {
+    o.store = storageKind()
+    const names = storageApiNames()
+    if (names) o.st = names
+  } catch (e) { /* 忽略 */ }
   try { o.model = String($falcon.env.deviceModel || '') } catch (e) { /* 无 $falcon */ }
   try { o.ui = String($falcon.env.version || '') } catch (e) { /* 忽略 */ }
   try { o.api = String($falcon.env.apiVersion || '') } catch (e) { /* 忽略 */ }
@@ -251,7 +258,7 @@ export function envDump() {
 // shell 通道：printf 不做转义解析，内容原样落盘；单引号交给 shq 处理。
 // 缺点是要把内容塞进命令行，超大文件会撞 ARG_MAX —— 目前最大的是 chats.json（几十 KB），
 // 离上限还很远。
-function writeViaShell(path, text) {
+export function writeViaShell(path, text) {
   const g = getGlobal()
   if (!g || typeof g.execShell !== 'function') return { ok: false, error: 'execShell 不可用' }
   try {
@@ -321,6 +328,29 @@ export function writeTextEx(path, text) {
 
 export function writeFileSync(path, data) {
   return writeTextEx(path, String(data == null ? '' : data)).ok
+}
+
+// 关键文件写入（curl 的请求体/请求头这种"写坏了就直接 400"的东西）。
+//
+// 为什么不信 fs.writeFile：同机型上另一个小程序实测「panet 的文件 API 报成功但不落盘」，
+// 表现就是 writeFile 返回正常、回读却是空文件或上一版内容。curl 拿到空 body 时，
+// 服务端只会回一句 400「请求参数有误」，看起来像接口问题，实际是本地没写进去。
+// 所以这里改走 shell 通道（printf 重定向，和 panet 不是一条路），写完回读比对，
+// 不一致再试 fs 通道；两条都不一致就返回 false，让调用方报错而不是把垃圾发出去。
+export async function writeTextVerified(path, text) {
+  const s = String(text == null ? '' : text)
+  if (writeViaShell(path, s).ok) {
+    const back = await readText(path, 2)
+    if (back === s) return true
+    logLine('W', 'shell 写入回读不一致 len ' + s.length + '/' + String(back == null ? 0 : back.length))
+  }
+  const r = writeTextEx(path, s)
+  if (r.ok) {
+    const back = await readText(path, 2)
+    if (back === s) return true
+    logLine('W', 'fs 写入回读不一致 len ' + s.length + '/' + String(back == null ? 0 : back.length))
+  }
+  return false
 }
 
 export async function removeFile(path) {

@@ -16,7 +16,8 @@
 //
 // 平台契约（真机验证）：execShell 无回显，一切产物靠文件落地 + 轮询。
 
-import { execShell, readText, writeText, removeFile, exists, ensureAppDir, joinPath, shq, sleep } from './platform.js'
+import { execShell, readText, writeText, writeTextVerified, removeFile, exists, ensureAppDir, joinPath, shq, sleep } from './platform.js'
+import { logLine } from '../lib/logfile.js'
 import { parseSse, readChunk } from '../lib/sse.js'
 import { holidaySources, parseHolidayPayload, HOLIDAY_UA } from '../lib/holiday.js'
 import { holdIncompleteTail, stripInternalTags } from '../lib/text.js'
@@ -64,7 +65,7 @@ export function explainError(status, text) {
   return 'HTTP ' + status + (msg ? '：' + msg : msg ? '' : (text ? String(text).slice(0, 120) : ''))
 }
 
-function buildCurl(opts) {
+async function buildCurl(opts) {
   const dir = tmpDir()
   const token = 'ds' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36)
   const reqFile = joinPath(dir, token + '.req.json')
@@ -77,7 +78,21 @@ function buildCurl(opts) {
   // 响应头单独落盘（只在要读 Date 校时的时候用）
   const respHdrFile = joinPath(dir, token + '.rhdr')
 
-  if (opts.body) writeText(reqFile, JSON.stringify(opts.body))
+  // 请求体和请求头必须"真的落盘"，否则 curl 发出去的是空 body / 没有认证头，
+  // 服务端只会回 400「请求参数有误」或者 401，看起来像接口坏了。走校验写入。
+  const bundle = {
+    token: token, reqFile: reqFile, hdrFile: hdrFile, outFile: outFile,
+    errFile: errFile, statusFile: statusFile, flagFile: flagFile, pidFile: pidFile,
+    respHdrFile: respHdrFile
+  }
+  if (opts.body) {
+    const bodyText = JSON.stringify(opts.body)
+    if (!(await writeTextVerified(reqFile, bodyText))) {
+      logLine('E', '请求体写入校验失败 len=' + bodyText.length + ' @ ' + reqFile)
+      await cleanup(bundle)
+      throw apiErr('WRITE', '请求体没写进存储（' + bodyText.length + ' 字节），已中止本次请求')
+    }
+  }
   // 没给 Key 的请求（如节假日数据）不要带空的 Authorization，
   // 有的 CDN / WAF 看到 `Bearer `（空值）会直接 400。
   let hdr = 'Content-Type: application/json\n'
@@ -85,7 +100,11 @@ function buildCurl(opts) {
   // jsDelivr 前面的 Cloudflare 会按 UA 判定：curl 默认 UA 会被丢进人机校验（403），
   // 所以拉第三方数据时显式伪装成桌面浏览器。
   if (opts.userAgent) hdr += 'User-Agent: ' + String(opts.userAgent) + '\n'
-  writeText(hdrFile, hdr)
+  if (!(await writeTextVerified(hdrFile, hdr))) {
+    logLine('E', '请求头写入校验失败 @ ' + hdrFile)
+    await cleanup(bundle)
+    throw apiErr('WRITE', '请求头没写进存储，已中止本次请求')
+  }
 
   const url = opts.url ? String(opts.url) : (String(opts.baseUrl).replace(/\/+$/, '') + opts.path)
   const secs = Math.ceil((opts.timeoutMs || DEFAULT_TIMEOUT_MS) / 1000)
@@ -107,11 +126,7 @@ function buildCurl(opts) {
 
   launchDetached(inner)
 
-  return {
-    token: token, reqFile: reqFile, hdrFile: hdrFile, outFile: outFile,
-    errFile: errFile, statusFile: statusFile, flagFile: flagFile, pidFile: pidFile,
-    respHdrFile: respHdrFile
-  }
+  return bundle
 }
 
 // 把命令丢到独立会话里跑，立刻返回。
@@ -152,7 +167,7 @@ async function readStatus(files) {
 // 列模型：设置页「扫描可用模型」与引导页「测试连接」共用
 export async function listModels(opts) {
   const timeoutMs = opts.timeoutMs || 15000
-  const files = buildCurl({
+  const files = await buildCurl({
     baseUrl: opts.baseUrl, apiKey: opts.apiKey, path: '/models',
     method: 'GET', timeoutMs: timeoutMs, body: null
   })
@@ -188,7 +203,7 @@ export function balanceEndpoint(baseUrl) {
 // serverTime 来自响应头 Date，用于校准设备时钟（峰谷判定完全依赖"现在几点"）。
 export async function fetchBalance(opts) {
   const timeoutMs = opts.timeoutMs || 8000
-  const files = buildCurl({
+  const files = await buildCurl({
     url: balanceEndpoint(opts.baseUrl),
     apiKey: opts.apiKey,
     method: 'GET',
@@ -259,7 +274,7 @@ export async function fetchHolidayYear(year, opts) {
   let lastErr = null
   for (let i = 0; i < list.length; i++) {
     const src = list[i]
-    const files = buildCurl({
+    const files = await buildCurl({
       url: src.url,
       apiKey: '',
       userAgent: HOLIDAY_UA,
@@ -314,7 +329,7 @@ async function waitFlag(files, timeoutMs) {
 export async function sendChat(opts) {
   const handlers = opts.handlers || {}
   const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS
-  const files = buildCurl({
+  const files = await buildCurl({
     baseUrl: opts.baseUrl, apiKey: opts.apiKey, path: '/chat/completions',
     method: 'POST', body: opts.body, timeoutMs: timeoutMs
   })
@@ -395,6 +410,9 @@ export async function sendChat(opts) {
     }
 
     const status = await readStatus(files)
+    // 一行结果：出问题时用户截图/日志就能看出是本地没发出去、还是服务端拒了
+    logLine(status === 200 ? 'I' : 'E', 'RES status=' + status + ' content=' + content.length +
+      ' reason=' + reasoning.length + (finishReason ? ' finish=' + finishReason : ''))
 
     if (upstreamError) throw apiErr('API', upstreamError)
     if (status && status !== 200) {
@@ -440,7 +458,7 @@ function explainCurl(errText) {
 // 两者的差别只有路径和返回体解析，没必要各写一遍。
 async function postJson(opts) {
   const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS
-  const files = buildCurl({
+  const files = await buildCurl({
     baseUrl: opts.baseUrl, apiKey: opts.apiKey, path: opts.path,
     method: 'POST', body: opts.body, timeoutMs: timeoutMs
   })

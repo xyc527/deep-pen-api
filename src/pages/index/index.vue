@@ -568,7 +568,8 @@ export default {
         // ---------- 输入 ----------
         async editText() {
             if (this.busy) return
-            const text = await openTextEditor(this.draft, { multiLine: true, confirmText: '完成' })
+            // 聊天输入默认中文（唤起后自动点一下「中/英」键，见 services/ime.js）
+            const text = await openTextEditor(this.draft, { multiLine: true, confirmText: '完成', zhCN: true })
             if (text === null || text === undefined) return
             this.draft = text
         },

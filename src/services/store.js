@@ -2,6 +2,7 @@
 // 不拿它做关键路径）。
 
 import { readText, readTextEx, writeText, writeTextEx, ensureAppDir, joinPath, exists, logLine } from './platform.js'
+import { storageGet, storageSet, storageAvailable } from './storage.js'
 import { normalizeSettings, DEFAULT_SETTINGS } from '../lib/settings.js'
 import { judgeReadback } from '../lib/savecheck.js'
 import { normalizeBalance } from '../lib/balance.js'
@@ -16,12 +17,37 @@ function p(name) {
   return joinPath(ensureAppDir(), name)
 }
 
+// 一条数据写两份：文件 + 宿主 storage。
+// 文件好用（adb 能直接看、能导出），但本机型有「writeFile 报成功却不落盘」的记录；
+// storage 是真会落盘的那个，但部分固件读回空串。所以两边都写，读的时候文件优先、
+// 读不到或内容坏了再读 storage —— 任一边正常，用户的设置和会话就不会丢。
+const MIRROR_MAX = 60000
+
+function mirror(name, text) {
+  const s = String(text == null ? '' : text)
+  if (!s || s.length > MIRROR_MAX) return
+  storageSet(name, s).then((ok) => {
+    if (!ok) logLine('W', 'storage 镜像失败 ' + name + ' len=' + s.length)
+  }, () => { /* 已在 storage 层吞过，这里再兜一层 */ })
+}
+
+async function readDoc(file, name, retries) {
+  if (await exists(file)) {
+    const r = await readTextEx(file, retries || 3)
+    if (r.ok && r.text) return r.text
+    if (!r.ok) logLine('W', '读文件失败 ' + name + ' :: ' + r.error)
+  }
+  const sv = await storageGet(name)
+  if (sv) {
+    logLine('W', '从 storage 恢复 ' + name + ' len=' + sv.length)
+    return sv
+  }
+  return null
+}
+
 export async function loadSettings() {
-  // 文件不存在是**确定性**答案（首次启动就是这样），不能当瞬时错误反复重试：
-  // 之前固定重试 4 次，冷启动会在日志里刷出 8 次 ENOENT，纯属浪费 flash I/O。
-  if (!(await exists(p(F_SETTINGS)))) return normalizeSettings(DEFAULT_SETTINGS)
-  // 存在但读到空，多半是写到一半被读到了，才值得重试
-  const raw = await readText(p(F_SETTINGS), 3)
+  // readDoc 内部：文件存在才读（不存在是确定性答案，不值得反复重试），文件读不到再读 storage
+  const raw = await readDoc(p(F_SETTINGS), F_SETTINGS, 3)
   if (!raw) return normalizeSettings(DEFAULT_SETTINGS)
   try {
     return normalizeSettings(JSON.parse(raw))
@@ -56,6 +82,7 @@ export function saveSettings(settings) {
     if (r.ok) {
       if (attempt > 1) logLine('W', 'saveSettings 第 ' + attempt + ' 轮才写成功')
       lastSave = { ok: true, reason: '', path: path, at: s.updatedAt, attempt: attempt }
+      mirror(F_SETTINGS, text)
       // 本机 writeFile 有"不报错也不落盘"的分支（实测把目标换成目录时就是），
       // 所以 ok 不等于写成功，必须回读确认。异步做，不拖慢自动保存。
       scheduleVerify(text, path)
@@ -63,6 +90,13 @@ export function saveSettings(settings) {
     }
     reason = r.error
     logLine('E', 'saveSettings 写失败 第' + attempt + '轮 :: ' + r.error + ' @ ' + path)
+  }
+  // 文件通道挂了但宿主 storage 还在：数据其实存下来了，别让用户看到"保存失败"
+  if (storageAvailable()) {
+    mirror(F_SETTINGS, text)
+    lastSave = { ok: true, reason: '仅存储通道', path: path, at: s.updatedAt, attempt: 2 }
+    logLine('W', 'saveSettings 改走 storage 通道（文件写入失败：' + shortErr(reason) + '）')
+    return s
   }
   lastSave = { ok: false, reason: shortErr(reason), path: path, at: Date.now(), attempt: 2 }
   return null
@@ -103,8 +137,7 @@ export async function selfTestWrite() {
 }
 
 export async function loadChats() {
-  if (!(await exists(p(F_CHATS)))) return []
-  const raw = await readText(p(F_CHATS), 3)
+  const raw = await readDoc(p(F_CHATS), F_CHATS, 3)
   if (!raw) return []
   try {
     const arr = JSON.parse(raw)
@@ -122,8 +155,7 @@ export const MAX_CONVERSATIONS = 24
 // 从系统相机返回时页面可能已经被框架重建，内存里的快照就没了，
 // 新拍的照片会被当成"首次基线"而静默丢掉（实机踩到过）。
 export async function loadPhotoSeen() {
-  if (!(await exists(p(F_PHOTO_SEEN)))) return null
-  const raw = await readText(p(F_PHOTO_SEEN), 2)
+  const raw = await readDoc(p(F_PHOTO_SEEN), F_PHOTO_SEEN, 2)
   if (!raw) return null
   try {
     const arr = JSON.parse(raw)
@@ -138,22 +170,26 @@ export async function loadPhotoSeen() {
 
 export function savePhotoSeen(photos) {
   const list = (photos || []).slice(0, 80).map((p) => ({ key: p.key, mtime: p.mtime || 0 }))
-  return writeText(p(F_PHOTO_SEEN), JSON.stringify(list))
+  const text = JSON.stringify(list)
+  const ok = writeText(p(F_PHOTO_SEEN), text)
+  mirror(F_PHOTO_SEEN, text)
+  return ok
 }
 
 export function saveChats(convs) {
   const list = (convs || []).slice()
   list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
   const kept = list.slice(0, MAX_CONVERSATIONS)
-  const ok = writeText(p(F_CHATS), JSON.stringify(kept))
+  const text = JSON.stringify(kept)
+  const ok = writeText(p(F_CHATS), text)
+  mirror(F_CHATS, text)
   return ok
 }
 
 // 余额缓存：单独一个文件，不去动 settings.json（那个每次改参数都会重写，
 // 混在一起容易在流式过程中互相覆盖）。
 export async function loadBalance() {
-  if (!(await exists(p(F_BALANCE)))) return null
-  const raw = await readText(p(F_BALANCE), 2)
+  const raw = await readDoc(p(F_BALANCE), F_BALANCE, 2)
   if (!raw) return null
   try {
     const b = normalizeBalance(JSON.parse(raw))
@@ -165,14 +201,16 @@ export async function loadBalance() {
 }
 
 export function saveBalance(balance) {
-  return writeText(p(F_BALANCE), JSON.stringify(normalizeBalance(balance)))
+  const text = JSON.stringify(normalizeBalance(balance))
+  const ok = writeText(p(F_BALANCE), text)
+  mirror(F_BALANCE, text)
+  return ok
 }
 
 // 节假日数据缓存：{ at, source, years: { '2026': [{date,isOffDay,name}, ...] } }
 // 一年只变一次，所以不做节流；存下来是为了断网 / 首次启动也能用真实安排。
 export async function loadHolidayCache() {
-  if (!(await exists(p(F_HOLIDAY)))) return null
-  const raw = await readText(p(F_HOLIDAY), 2)
+  const raw = await readDoc(p(F_HOLIDAY), F_HOLIDAY, 2)
   if (!raw) return null
   try {
     const o = JSON.parse(raw)
@@ -184,7 +222,10 @@ export async function loadHolidayCache() {
 }
 
 export function saveHolidayCache(cache) {
-  return writeText(p(F_HOLIDAY), JSON.stringify(cache))
+  const text = JSON.stringify(cache)
+  const ok = writeText(p(F_HOLIDAY), text)
+  mirror(F_HOLIDAY, text)
+  return ok
 }
 
 export function exportAll(settings, convs) {
