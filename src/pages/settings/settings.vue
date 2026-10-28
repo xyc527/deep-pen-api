@@ -809,7 +809,7 @@ export default {
         },
         async editSystem() {
             if (!this.settings) { this.connStatus = '配置还在读取，请稍候再点'; return }
-            const text = await openTextEditor(this.settings.systemPrompt || '', { multiLine: true, confirmText: '完成', maxlength: 1200, zhCN: true })
+            const text = await openTextEditor(this.settings.systemPrompt || '', { multiLine: true, confirmText: '完成', maxlength: 1200 })
             if (text === null || text === undefined) return
             this.apply({ systemPrompt: String(text) })
         },
