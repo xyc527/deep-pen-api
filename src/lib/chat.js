@@ -94,6 +94,53 @@ export function lastAssistant(conv) {
   return null
 }
 
+// ---------- 单句操作（重新生成 / 修改内容）----------
+// 这两件事都是"从某条消息开始把后面的内容切掉"，切的边界只由角色和位置决定，
+// 抽成纯函数才能被单测覆盖（组件里删错一格就是丢用户数据的 bug）。
+
+export function findMessageIndex(messages, id) {
+  const list = messages || []
+  for (let i = 0; i < list.length; i++) if (list[i] && list[i].id === id) return i
+  return -1
+}
+
+// 重新生成：
+//   assistant → 它自己及之后全删（keep = i），用前面最近的一条 user 当提问
+//   user      → 保留它（keep = i+1），删掉之后那条回答，用它自己当提问
+// 返回 null 表示不能操作（找不到 / 前面没有提问）。
+export function planRegenerate(messages, id) {
+  const list = messages || []
+  const i = findMessageIndex(list, id)
+  if (i < 0) return null
+  const m = list[i]
+  const tail = list.length - 1 - i
+  if (m.role !== 'assistant') return { index: i, role: 'user', keep: i + 1, promptId: m.id, tail: tail, tailForPrompt: tail }
+  let k = -1
+  for (let j = i - 1; j >= 0; j--) {
+    if (list[j] && list[j].role === 'user') { k = j; break }
+  }
+  if (k < 0) return null
+  return { index: i, role: 'assistant', keep: i, promptId: list[k].id, tail: tail, tailForPrompt: tail }
+}
+
+// 修改内容：
+//   assistant → 只改这段文字，后面的内容不动（keep = 全部）
+//   user      → 改完要重跑，后面的内容全删
+export function planEdit(messages, id) {
+  const list = messages || []
+  const i = findMessageIndex(list, id)
+  if (i < 0) return null
+  const m = list[i]
+  const tail = list.length - 1 - i
+  return {
+    index: i,
+    role: m.role,
+    rerun: m.role === 'user',
+    keep: m.role === 'user' ? i + 1 : list.length,
+    tail: tail
+  }
+}
+
 export function summarizeUsage(usage) {
   if (!usage) return ''
   const parts = []

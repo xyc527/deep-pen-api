@@ -22,6 +22,7 @@
                     <div v-if="m.role === 'assistant' && !m.pending" class="ix-meta" @click="toggleReason(m)"><text class="ix-metatxt">{{ reasonToggle(m) }}</text></div>
                 </div>
 
+
                 <!-- 联网检索中的状态。搜索是同步请求，1–3 秒才有结果，
                      不给提示的话屏幕上毫无变化，看着像卡死 -->
                 <div v-if="m.searching" class="ix-searching">
@@ -50,10 +51,14 @@
                     </div>
                 </div>
 
-                <text v-if="m.error" class="ix-err">{{ m.error }}</text>
+                <!-- 出错的消息只有这行红字（没有正文节点）；不挂点击就永远选不中，
+                     也就没法重抽那条失败的请求（实测踩到） -->
+                <text v-if="m.error" class="ix-err" @click="selectMsg(m)">{{ m.error }}</text>
 
                 <!-- Markdown + LaTeX。run 必须同级平铺：<text> 带元素子节点会让框架 abort -->
-                <div v-else class="ix-md">
+                <!-- 点正文 = 选中该句。只挂在这一层：头部（思考过程）和来源自己
+                     有点击行为，挂到外层会被子元素吃掉命中（本平台老问题） -->
+                <div v-else class="ix-md" @click="selectMsg(m)">
                     <div v-for="(b, bi) in plan(m)" :key="bi" class="ix-blk">
                         <div v-if="b.type === 'p'" class="ix-p">
                             <template v-for="(r, ri) in b.runs" :key="ri">
@@ -98,6 +103,15 @@
             </div>
             <div ref="bottom" class="ix-anchor"></div>
         </scroller>
+
+        <!-- 选中操作条：**固定**在输入条上方，不跟着消息滚。
+             先做成消息内联的，长回答滚到底部后操作条留在屏幕外，点不到（实测）。 -->
+        <div v-if="selId" class="ix-actbar">
+            <text class="ix-acthint">{{ selHint }}</text>
+            <div class="ix-act" @click="regenSel"><text class="ix-acttxt">重新生成</text></div>
+            <div class="ix-act" @click="editSel"><text class="ix-acttxt">修改内容</text></div>
+            <div class="ix-act-c" @click="clearSel"><text class="ix-acttxt">取消</text></div>
+        </div>
 
         <!-- 输入条 -->
         <div class="ix-input">
@@ -149,6 +163,20 @@
                 </scroller>
             </div>
         </div>
+
+        <!-- 清空确认：只有选中的那句**后面还有内容**才出现（最后一句直接执行）。
+             用自绘层而不是 toast/alert：本平台没有可用的确认框组件，闪一下就没了，
+             用户根本来不及看清会删掉多少东西。 -->
+        <div v-if="ask" class="ix-overlay-dim">
+            <div class="ix-confirm">
+                <text class="ix-confirmtitle">{{ askTitle }}</text>
+                <text class="ix-confirmtext">{{ askText }}</text>
+                <div class="ix-confirmrow">
+                    <div class="ix-act" @click="cancelAsk"><text class="ix-acttxt">取消</text></div>
+                    <div class="ix-act-go" @click="confirmAsk"><text class="ix-acttxt-go">确定清空</text></div>
+                </div>
+            </div>
+        </div>
     </div>
 </template>
 
@@ -163,7 +191,7 @@ import { isReady } from '../../lib/settings.js'
 import { buildBody, describeBody } from '../../lib/params.js'
 import { renderPlan, needsPaperSheet } from '../../lib/md.js'
 import { shortModelLabel } from '../../lib/params.js'
-import { buildApiMessages, newConversation, newMessage, ensureTitle, summarizeUsage } from '../../lib/chat.js'
+import { buildApiMessages, newConversation, newMessage, ensureTitle, summarizeUsage, planRegenerate, planEdit } from '../../lib/chat.js'
 import { addPhoto, removePhoto, diffNewPhotos, formatSize } from '../../lib/photos.js'
 import { billingPeriod, setTimeSkew, nowMs } from '../../lib/peak.js'
 import { balanceChipText, balanceLevel } from '../../lib/balance.js'
@@ -217,6 +245,10 @@ export default {
             maxImages: MAX_IMAGES,
             delId: '',
             urlCache: {},
+            // 选中要操作的消息（点消息正文选中，再出「重新生成 / 修改内容」）
+            selId: '',
+            // 待确认的操作 { kind, id, text }：只有该句后面还有内容时才弹
+            ask: null,
             // 余额 + 计费时段（余额落盘缓存，断网时显示上次的值）
             bal: null,
             balBusy: false,
@@ -237,6 +269,27 @@ export default {
         },
         messages() {
             return this.conv ? this.conv.messages : []
+        },
+        selMsg() {
+            const i = this.idxOf(this.selId)
+            return i < 0 ? null : this.messages[i]
+        },
+        selHint() {
+            // 注意：selMsg 是 computed（属性），不能写成 this.selMsg()
+            const m = this.selMsg
+            if (!m) return ''
+            return m.role === 'user' ? '已选：我的提问' : '已选：这条回答'
+        },
+        askTitle() {
+            if (!this.ask) return ''
+            return this.ask.kind === 'edit' ? '修改内容' : '重新生成'
+        },
+        askText() {
+            const a = this.ask
+            if (!a) return ''
+            const n = Number(a.tail) || 0
+            const what = a.kind === 'edit' ? '修改' : '重新生成'
+            return '这句之后还有 ' + n + ' 条内容，' + what + '会把它们一起清空，且无法恢复。'
         },
         title() {
             return this.conv ? this.conv.title : 'DeepSeek'
@@ -325,10 +378,16 @@ export default {
         // 模型 / 采样参数全都同步不过来：用户把 Key 改错，返回后照样能聊，
         // 因为发请求用的是这份旧 settings。
         this.unsubUi = subscribeUiState((s) => {
-            if (s.settings && s.settingsRev !== this.settingsRev) {
+            if (s.settings && s.settingsRev > this.settingsRev) {
                 this.settingsRev = s.settingsRev
-                this.settings = s.settings
-                this.applyShowBalance(s.settings)
+                // **必须复制成自己的一份**：广播过来的是设置页那个组件的对象，
+                // 直接拿来用会出现「改了芯片只写盘、界面不刷新」——本平台对
+                // 跨页面实例的深层改写派发不稳定（实测）。拷一层普通对象后，
+                // this.settings 的引用变化始终由本页自己控制。
+                this.settings = Object.assign({}, s.settings, {
+                    params: Object.assign({}, s.settings.params)
+                })
+                this.applyShowBalance(this.settings)
                 return
             }
             if (this.showBal === s.showBalance) return
@@ -488,7 +547,14 @@ export default {
         async refreshSettings() {
             const s = await loadSettings()
             if (!s) return
-            this.settings = s
+            // 磁盘那份比手上这份旧就跳过：写盘有延迟时（本机很常见），
+            // 用磁盘旧值覆盖内存新值 = 刚关掉的开关又自己弹回去。
+            const cur = this.settings
+            if (cur && cur.updatedAt && s.updatedAt && s.updatedAt < cur.updatedAt) {
+                this.settingsRev = getUiState().settingsRev
+                return
+            }
+            this.settings = Object.assign({}, s, { params: Object.assign({}, s.params) })
             this.settingsRev = getUiState().settingsRev
             this.applyShowBalance(s)
             if (!isReady(s)) {
@@ -634,6 +700,8 @@ export default {
             this.images = []
             this.draft = ''
             this.view = 'chat'
+            this.selId = ''
+            this.ask = null
             saveChats(this.convs)
         },
         openDrawer() {
@@ -647,6 +715,8 @@ export default {
         switchConv(c) {
             this.convId = c.id
             this.view = 'chat'
+            this.selId = ''
+            this.ask = null
             this.scrollToBottom(true)
         },
         removeConv(c) {
@@ -672,9 +742,14 @@ export default {
             return false
         },
         toggleThink() {
+            // **整体换 settings 对象**，不要写成 this.settings.params = p。
+            // 就地改深层字段时，本平台不一定重算依赖它的 computed：
+            // 表现就是从设置页回来后点「思考」没有反应，得先点一下「联网」
+            // （那个方法换了整份 settings）芯片才刷新 —— 用户反馈的正是这个。
             const p = Object.assign({}, this.settings.params)
             p.thinking = p.thinking === false
-            this.settings.params = p
+            this.settings = Object.assign({}, this.settings, { params: p })
+            log('think ' + (p.thinking === false ? 'off' : 'on'))
             this.saveSettingsQuiet('think')
         },
         // 三档循环：关 → 自动 → 常开 → 关。
@@ -718,10 +793,13 @@ export default {
         // 万一订阅回调因为页面重建/时序没跑到，也不会用旧 Key 发请求。
         async ensureFreshSettings() {
             const rev = getUiState().settingsRev
-            if (rev !== this.settingsRev) {
+            // 只有「广播的比手上这份新」才重读磁盘。以前用 !=，导致本页刚改完
+            // 而 rev 还没对齐时，一发请求就把内存里的新值换成磁盘旧值（写盘慢半拍
+            // 时就是「刚关掉思考，下一条回答还在思考」）。
+            if (rev > this.settingsRev) {
                 const s = await loadSettings()
                 if (s) {
-                    this.settings = s
+                    this.settings = Object.assign({}, s, { params: Object.assign({}, s.params) })
                     this.settingsRev = rev
                     this.applyShowBalance(s)
                 }
@@ -751,7 +829,23 @@ export default {
             ensureTitle(conv)
             this.draft = ''
             this.images = []
+            this.selId = ''
+            await this.runChat(conv, userMsg)
+        },
 
+        // 真正发一轮请求：把「提问之前」的那三步（校验 Key、建占位消息、置忙）
+        // 和「提问之后」的流式处理收在一起，重抽 / 修改内容直接复用它。
+        // userMsg 必须传进来：send 里已经清空了输入框和图片，不能再读 this.images。
+        async runChat(conv, userMsg) {
+            if (!conv || !userMsg) return
+            // 提问原文：send 里已经清空了 this.draft，重抽/改写的调用点也没有草稿，
+            // 所以一切都以传进来的这条消息为准。
+            const text = String(userMsg.content || '')
+            const settings = await this.ensureFreshSettings()
+            if (!settings || !isReady(settings)) {
+                this.flash('还没填有效的 API Key，去「设置 → 连接」填一下')
+                return
+            }
             const bot = newMessage('assistant', '')
             bot.pending = true
             conv.messages.push(bot)
@@ -849,6 +943,90 @@ export default {
             this.cancelled = true
         },
 
+        // ---------- 单句操作：重新生成 / 修改内容 ----------
+        // 选中 = 点消息正文。头部「思考过程」、来源标签各自有点击行为，
+        // 所以把 @click 只挂在正文那层，避免子元素把命中吃掉（本平台老问题）。
+        idxOf(id) {
+            const list = this.messages
+            for (let i = 0; i < list.length; i++) if (list[i].id === id) return i
+            return -1
+        },
+
+        selectMsg(m) {
+            if (this.busy || !m || m.pending) return
+            this.selId = this.selId === m.id ? '' : m.id
+        },
+        clearSel() { this.selId = '' },
+        regenSel() { const m = this.selMsg; if (m) this.askRegen(m) },
+        editSel() { const m = this.selMsg; if (m) this.askEdit(m) },
+        cancelAsk() { this.ask = null },
+        askRegen(m) {
+            if (this.busy) { this.flash('正在生成，先点「停止」'); return }
+            const plan = planRegenerate(this.messages, m.id)
+            if (!plan) { this.flash('这条消息前面没有提问，无法重抽'); return }
+            if (plan.tail > 0) { this.ask = { kind: 'regen', id: m.id, tail: plan.tail }; return }
+            this.doRegen(m.id)
+        },
+        askEdit(m) {
+            if (this.busy) { this.flash('正在生成，先点「停止」'); return }
+            const plan = planEdit(this.messages, m.id)
+            if (!plan) return
+            const self = this
+            openTextEditor(String(m.content || ''), { multiLine: true, confirmText: '完成' }).then(function (v) {
+                // null = 用户取消，绝不能当成"清空内容"
+                if (v === null || v === undefined) return
+                if (plan.tail > 0) { self.ask = { kind: 'edit', id: m.id, text: v, tail: plan.tail }; return }
+                self.doEdit(m.id, v)
+            })
+        },
+        confirmAsk() {
+            const a = this.ask
+            if (!a) return
+            this.ask = null
+            if (a.kind === 'edit') this.doEdit(a.id, a.text)
+            else this.doRegen(a.id)
+        },
+        // 重新生成：
+        //   assistant → 删掉它和它之后的一切，用前面最近的一条用户提问重跑
+        //   user      → 保留它，删掉它之后的一切（那条回答），用它重跑
+        async doRegen(id) {
+            const conv = this.conv
+            if (!conv) return
+            const plan = planRegenerate(conv.messages, id)
+            if (!plan) { this.flash('这条消息前面没有提问，无法重抽'); return }
+            const prompt = conv.messages[this.idxOf(plan.promptId)]
+            if (!prompt) { this.flash('找不到可用的提问'); return }
+            conv.messages.splice(plan.keep)
+            conv.updatedAt = Date.now()
+            this.selId = ''
+            log('REGEN idx=' + plan.index + ' role=' + plan.role + ' left=' + conv.messages.length)
+            saveChats(this.convs)
+            await this.runChat(conv, prompt)
+        },
+        // 修改内容：
+        //   assistant → 只改这段回答的文字（不重跑，适合修错字/补一句）
+        //   user      → 改提问原文，然后清掉后面的回答重跑
+        async doEdit(id, text) {
+            const conv = this.conv
+            if (!conv) return
+            const plan = planEdit(conv.messages, id)
+            if (!plan) return
+            const m = conv.messages[plan.index]
+            if (!m) return
+            m.content = String(text == null ? '' : text)
+            m.error = ''
+            // 渲染计划按 (id, 长度, pending) 缓存，同长度改写会命中旧结果 → 必须清
+            delete planCache[m.id]
+            this.selId = ''
+            conv.messages.splice(plan.keep)
+            conv.updatedAt = Date.now()
+            ensureTitle(conv)
+            saveChats(this.convs)
+            log('EDIT ' + m.role + ' idx=' + plan.index + ' len=' + m.content.length + ' rerun=' + (plan.rerun ? 1 : 0))
+            if (plan.rerun) { await this.runChat(conv, m); return }
+            this.flash('已修改')
+        },
+
         // 流式写入节流：每个 token 都写 data 会让整条消息重新 parse + 重新渲染，
         // 回复越长越卡（长回复时 CPU 直接打满，界面像死机）。压到 ~5 次/秒，
         // 首包立即出、尾包在 streamFlush 里补，肉眼仍是"逐字冒出"。
@@ -918,8 +1096,7 @@ export default {
             return this.paper(m) ? base + '-p' : base
         },
         msgStyle(m) {
-            if (!this.paper(m)) return {}
-            return {
+            if (this.paper(m)) return {
                 backgroundColor: '#f4f2ea',
                 borderRadius: '8px',
                 paddingLeft: '8px',
@@ -927,6 +1104,18 @@ export default {
                 paddingTop: '5px',
                 paddingBottom: '5px'
             }
+            // 选中态：只给整条消息垫一层浅色底，不改类名（多类叠加优先级不可靠）
+            if (this.selId === m.id) {
+                return {
+                    backgroundColor: '#20262f',
+                    borderRadius: '8px',
+                    paddingLeft: '8px',
+                    paddingRight: '8px',
+                    paddingTop: '4px',
+                    paddingBottom: '4px'
+                }
+            }
+            return {}
         },
         // 纸面里公式不再需要自己的底色（整条已经是纸），把卡片收成"无内边距、透明"
         mathCardStyle(m) {
@@ -1207,6 +1396,110 @@ export default {
     flex-direction: row;
     align-items: center;
     margin-bottom: 2px;
+}
+
+/* 单句操作条：固定在输入条上方（top 202 / 高 28），滚动不影响命中。
+   高度 24px 的按钮（笔上低于 22px 命中率明显变差），按钮间隔 8px。 */
+.ix-actbar {
+    position: absolute;
+    left: 12px;
+    top: 202px;
+    flex-direction: row;
+    align-items: center;
+    height: 28px;
+    padding-left: 8px;
+    padding-right: 8px;
+    border-radius: 8px;
+    background-color: #1b1f27;
+}
+
+.ix-acthint {
+    font-size: 11px;
+    color: #8b91a0;
+    margin-right: 10px;
+}
+
+.ix-act {
+    flex-direction: row;
+    align-items: center;
+    height: 24px;
+    padding-left: 10px;
+    padding-right: 10px;
+    border-radius: 5px;
+    background-color: #2f3540;
+    margin-right: 8px;
+}
+
+.ix-act-c {
+    flex-direction: row;
+    align-items: center;
+    height: 24px;
+    padding-left: 10px;
+    padding-right: 10px;
+    border-radius: 5px;
+    background-color: #24262c;
+    margin-right: 8px;
+}
+
+.ix-acttxt {
+    font-size: 12px;
+    color: #dfe3ea;
+}
+
+.ix-act-go {
+    flex-direction: row;
+    align-items: center;
+    height: 24px;
+    padding-left: 12px;
+    padding-right: 12px;
+    border-radius: 5px;
+    background-color: #c9483c;
+    margin-right: 8px;
+}
+
+.ix-acttxt-go {
+    font-size: 12px;
+    color: #fff4f2;
+}
+
+/* 清空确认：半透明遮罩（还能看见要删的是哪一段）+ 居中面板 */
+.ix-overlay-dim {
+    position: absolute;
+    top: 0;
+    left: 0;
+    flex-direction: column;
+    width: 936px;
+    height: 280px;
+    background-color: rgba(0, 0, 0, 0.55);
+}
+
+/* 清空确认框：居中一块面板 */
+.ix-confirm {
+    position: absolute;
+    left: 268px;
+    top: 92px;
+    width: 400px;
+    flex-direction: column;
+    padding: 14px;
+    border-radius: 10px;
+    background-color: #23262d;
+}
+
+.ix-confirmtitle {
+    font-size: 14px;
+    color: #f0f2f6;
+    margin-bottom: 6px;
+}
+
+.ix-confirmtext {
+    font-size: 12px;
+    color: #a9aeb8;
+    margin-bottom: 12px;
+}
+
+.ix-confirmrow {
+    flex-direction: row;
+    align-items: center;
 }
 
 .ix-roleuser {

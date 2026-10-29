@@ -5,7 +5,7 @@ import { splitMath, latexToUnicode, canTypeset, isBalanced, splitMathLines, esti
 import { inlineRuns, runsWithMath, parseBlocks, renderPlan, promoteInlineBlocks, needsPaperSheet } from '../src/lib/md.js'
 import { defaultParams, buildBody, describeBody, scopeOf, clampNumber, parseStop, PARAM_MAP, modelOptions } from '../src/lib/params.js'
 import { normalizeSettings, normalizeBaseUrl, maskKey, isReady, settingsSignature, saveButtonState } from '../src/lib/settings.js'
-import { buildApiMessages, newMessage, titleFrom, ensureTitle, trimMessages, summarizeUsage } from '../src/lib/chat.js'
+import { buildApiMessages, newMessage, titleFrom, ensureTitle, trimMessages, summarizeUsage, planRegenerate, planEdit, findMessageIndex } from '../src/lib/chat.js'
 import { diffNewPhotos, addPhoto, removePhoto, sortByMtimeDesc, isImageName, formatSize } from '../src/lib/photos.js'
 import { billingPeriod, isHoliday, formatRemain, describePeriod, holidayTableYears, setTimeSkew, nowMs, applyHolidayDays, isMakeupWorkday, holidayYearFrom } from '../src/lib/peak.js'
 import { parseHolidayPayload, countHolidayDays, holidaySources } from '../src/lib/holiday.js'
@@ -1092,6 +1092,50 @@ function writePlanSuite() {
 dirChainSuite()
 
 writePlanSuite()
+
+function msgSuite() {
+  // 单句操作（重新生成 / 修改内容）的截断边界。
+  // 这是"删错一格就丢用户数据"的地方，边界必须逐条钉死。
+
+  const u1 = { id: 'u1', role: 'user', content: 'q1' }
+  const a1 = { id: 'a1', role: 'assistant', content: 'r1' }
+  const u2 = { id: 'u2', role: 'user', content: 'q2' }
+  const a2 = { id: 'a2', role: 'assistant', content: 'r2' }
+  const list = [u1, a1, u2, a2]
+
+  eq(findMessageIndex(list, 'u2'), 2, '按 id 找下标')
+  eq(findMessageIndex(list, 'nope'), -1, '找不到返回 -1')
+
+  // 最后一条 assistant：keep = 它自己的下标（自己及之后全删），tail = 0（不弹确认）
+  eq(planRegenerate(list, 'a2'), { index: 3, role: 'assistant', keep: 3, promptId: 'u2', tail: 0, tailForPrompt: 0 },
+    '重抽最后一条回答：从它自己开始删、用上一条提问')
+  // 中间那条 assistant：tail = 1，要确认
+  eq(planRegenerate(list, 'a1').tail, 2, '重抽中间回答：后面还有 2 条（提问+回答），需要确认')
+  eq(planRegenerate(list, 'a1').keep, 1, '重抽中间回答：保留前 1 条')
+  eq(planRegenerate(list, 'a1').promptId, 'u1', '重抽中间回答：提问取前面最近的那句')
+
+  // user 消息：保留自己（keep = i+1），后面全删
+  eq(planRegenerate(list, 'u2'), { index: 2, role: 'user', keep: 3, promptId: 'u2', tail: 1, tailForPrompt: 1 },
+    '重抽用户消息：保留提问本身、删掉后面的回答')
+  eq(planRegenerate(list, 'u1').keep, 1, '重抽第一条提问：只保留它自己')
+
+  // 第一条就是 assistant（前面没有提问）→ 不能操作
+  eq(planRegenerate([a1, u1], 'a1'), null, '前面没有提问时返回 null')
+
+  // 修改内容
+  eq(planEdit(list, 'a2'), { index: 3, role: 'assistant', rerun: false, keep: 4, tail: 0 }, '改最后一条回答：只改文字不重跑')
+  eq(planEdit(list, 'a1'), { index: 1, role: 'assistant', rerun: false, keep: 4, tail: 2 }, '改中间回答：后面内容保持不动')
+  eq(planEdit(list, 'u2'), { index: 2, role: 'user', rerun: true, keep: 3, tail: 1 }, '改提问：清掉后面的回答并重跑')
+  eq(planEdit(list, 'u1').keep, 1, '改第一条提问：keep 只留在它自己之后')
+  eq(planEdit(list, 'nope'), null, '找不到消息时返回 null')
+
+  // 空列表不该炸
+  eq(planRegenerate([], 'x'), null, '空列表重抽返回 null')
+  eq(planEdit([], 'x'), null, '空列表修改返回 null')
+}
+
+msgSuite()
+
 
 searchSuite()
 
