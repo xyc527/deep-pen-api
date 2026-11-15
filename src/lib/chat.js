@@ -55,6 +55,7 @@ export function trimMessages(messages, maxMessages) {
 
 // 组装发给 API 的 messages。
 // imageUrlOf(path) 由调用方提供（同步返回 data URL 或 null），保持本函数可测。
+// memoryText：压缩记忆的正文，作为第二条 system 跟在系统提示词后面。
 export function buildApiMessages(messages, opts) {
   const o = opts || {}
   const max = typeof o.maxMessages === 'number' ? o.maxMessages : 24
@@ -62,7 +63,14 @@ export function buildApiMessages(messages, opts) {
   const out = []
 
   if (o.systemPrompt) out.push({ role: 'system', content: String(o.systemPrompt) })
+  // 记忆单独一条 system：混进系统提示词里会被"人设"那份冲淡，
+  // 而且导出记录时也没法区分哪部分是记住的、哪部分是设定
+  if (o.memoryText) out.push({ role: 'system', content: String(o.memoryText) })
 
+  // 历史第一条会不会是 assistant：扮演模式有「开场白」，对话就是角色先开口的。
+  // 直接把 assistant 打头发出去，有的模型会 400（要求 user 起头 / 严格交替），
+  // 所以把它改写成一条 system 说明 —— 语义还在，格式也合规。
+  let first = true
   for (let i = 0; i < list.length; i++) {
     const m = list[i]
     const imgs = (m.images || []).slice()
@@ -81,9 +89,17 @@ export function buildApiMessages(messages, opts) {
       if (parts.length === 1 && parts[0].type === 'text') out.push({ role: 'user', content: parts[0].text })
       else if (parts.length) out.push({ role: 'user', content: parts })
       else out.push({ role: 'user', content: '（' + imgs.length + ' 张图片读取失败，无法显示）' })
+      first = false
       continue
     }
-    out.push({ role: m.role, content: String(m.content || '') })
+    const text = String(m.content || '')
+    if (first && m.role === 'assistant') {
+      if (text.trim()) out.push({ role: 'system', content: '对话是你自己先开的头，你当时说：\n' + text })
+      first = false
+      continue
+    }
+    first = false
+    out.push({ role: m.role, content: text })
   }
   return out
 }

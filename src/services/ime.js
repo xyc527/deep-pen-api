@@ -124,14 +124,21 @@ export function openTextEditor(initialText, options) {
         text: text,
         contents: text
       }
-      // 键盘一进来是中文还是英文：本固件不由调用方决定。实测 startTextEdit 里传
-      // ZhCNPreferred / inputType:'zh_CN' / ZhCNOnly 全被忽略（键盘一律英文起步），
-      // 改 rime user.yaml 的 option.ascii_mode 也无效；唯一可靠的是键盘上那个「中/英」键，
-      // 由用户自己点。别再往这里加语言字段了，加也不生效。
-      // inputType 是 SDK 里的枚举，本工程不依赖 SDK；留空则不传，由输入法取默认。
-      if (opts.inputType !== undefined && opts.inputType !== null && opts.inputType !== '') {
-        config.inputType = opts.inputType
-      }
+      // 键盘默认语言：inputType 是系统输入法 App 的 InputPage 的合法 prop，
+      // 值域（从该 App 字节码确认）：
+      //   EnUSPreferred（英文默认） / EnUSOnly / ZhCNPreferred / ZhCNOnly
+      //   / NumberPreferred / PunctuationPreferred / RecordPreferred / SymbolsPreferred
+      //   / ViVNPreferred / ViVNOnly
+      // 注意是「ZhCNPreferred」不是「ZhHansPreferred」——字节码里没有 ZhHans 这个值。
+      //
+      // 默认传 ZhCNPreferred，键盘即中文拼音起步（左下角自带「中/英」切换）。
+      // 见 dictpen-miniapp skill 的 native-capabilities.md §1：inputType 只影响语义、
+      // 不影响回传，各种值（含 ABC）弹的都是同一套拼音键盘。曾有一版注释误写成
+      // 「传了仍是英文起步、固件不解析 inputType」，那是把「回传只解析 text/contents」
+      // 跟「键盘默认语言」两件事搞混了，真机实测中文起步，已更正。
+      config.inputType = (opts.inputType !== undefined && opts.inputType !== null && opts.inputType !== '')
+        ? opts.inputType
+        : 'ZhCNPreferred'
       g.startTextEdit(JSON.stringify(config))
     } catch (e) {
       log('startTextEdit 失败 ' + e)

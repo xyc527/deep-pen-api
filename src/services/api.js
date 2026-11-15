@@ -540,3 +540,41 @@ export async function sendOnce(opts) {
     status: r.status
   }
 }
+
+// ---- 通用 GET 取 JSON ----
+//
+// 给「一次请求就出结果」的外部数据源用（高德这类 REST 接口）。跟对话接口的区别：
+// 不需要请求体、不需要鉴权头（Key 拼在 URL 里）、要的是完整 body 而不是流。
+// 复用 buildCurl 那套「落盘 + 轮询 flag」的机制 —— 本机 execShell 是同步阻塞的，
+// 直接 curl 会把界面卡死（见文件头部的说明）。
+//
+// 返回 {ok, status, body, error}：ok 只表示"curl 跑完了"，业务成败看 status 与 body。
+export async function fetchJsonGet(url, opts) {
+  const options = opts || {}
+  const timeoutMs = options.timeoutMs || 8000
+  let files = null
+  try {
+    files = await buildCurl({
+      url: String(url || ''),
+      apiKey: '',
+      userAgent: options.userAgent || '',
+      method: 'GET',
+      timeoutMs: timeoutMs,
+      connectTimeoutS: 5,
+      body: null,
+      dumpHeaders: false
+    })
+    const done = await waitFlag(files, timeoutMs)
+    if (!done) {
+      cancelFiles(files)
+      return { ok: false, status: 0, body: '', error: 'TIMEOUT' }
+    }
+    const status = await readStatus(files)
+    const body = (await readText(files.outFile, 2)) || ''
+    return { ok: true, status: Number(status) || 0, body: body, error: '' }
+  } catch (e) {
+    return { ok: false, status: 0, body: '', error: (e && e.message) || 'ERR' }
+  } finally {
+    if (files) await cleanup(files)
+  }
+}

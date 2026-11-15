@@ -3,6 +3,7 @@
     "index": "pages/index/index.vue",
     "setup": "pages/setup/setup.vue",
     "settings": "pages/settings/settings.vue",
+    "settingsx": "pages/settingsx/settingsx.vue",
     "latexlab": "pages/latexlab/latexlab.vue"
   }
 }

@@ -17,6 +17,14 @@ import { judgeReadback, readbackHint } from '../src/lib/savecheck.js'
 import { normPath, mkdirChain } from '../src/lib/paths.js'
 import { planWrites, describeWriteFail, WRITE_ORDER } from '../src/lib/writeplan.js'
 import { APP_VERSION } from '../src/lib/appversion.js'
+import { normalizeDoc, emptyDoc, pickProfile, writeProfile, profileKey, setMode, addPersona, removePersona, setActivePersona, renamePersona, setPersonaCard, cloneProfile, personasBrief, findPersona, MAX_PERSONAS, DOC_VERSION } from '../src/lib/profile.js'
+import { normalizeCard, personaSystemPrompt, parsePersonaFile, nameFromFile, cardIsEmpty, greetingOf, CARD_ROWS } from '../src/lib/persona.js'
+import { sectionsFor, sectionById, hasGroup, sectionStatus } from '../src/lib/sections.js'
+import { normalizeMemory, memoryEntry, foldMessages, pruneNotes, memoryText, memorySummary, planCompression, notesAfter, MEMORY_DEFAULT } from '../src/lib/memory.js'
+import { buildSettingsDoc, buildRecordsDoc, parseSettingsArchive, parseRecordsArchive, detectKind, archiveSummary, profileFolder, stampText, buildPersonaCardDoc, buildPersonaSampleDoc, personaFileName, ROOT_DIR, EXPORT_DIR, IMPORT_DIR, PERSONA_DIR } from '../src/lib/archive.js'
+import { AMAP_BASE, AMAP_CODES, amapErrorText, amapReady, amapKeyOf, placeSearchUrl, placeAroundUrl, weatherUrl, geocodeUrl, regeoUrl, drivingUrl, parseAmap, poiList, weatherNow, weatherForecast, geocodeFirst, regeoText, routeBrief, fmtDistance, fmtDuration, poiSubtitle, weatherLine, weatherRows } from '../src/lib/amap.js'
+import { parseMapIntent, pickCity, pickRoute, pickPlace, formatMapContext, mapChipLabel } from '../src/lib/mapintent.js'
+import { plan, fitViewport, isSaneScreen, normalizeScreen, DESIGN_W, DESIGN_H } from '../src/lib/fit.js'
 import { readFileSync } from 'fs'
 
 let pass = 0
@@ -373,6 +381,18 @@ function eq(a, b, name) {
   eq(okImg[0].content.length, 1, '纯图消息只有 image_url 段')
   eq(okImg[0].content[0].type, 'image_url', '纯图走 image_url')
 
+  // 开场白：扮演模式的对话是角色先开口的。assistant 打头原样发出去，
+  // 有的模型会 400（要求 user 起头 / 严格交替），所以改成 system 说明。
+  const greet = newMessage('assistant', '你回来啦')
+  const gApi = buildApiMessages([greet, newMessage('user', '嗯')], { systemPrompt: '设定', maxMessages: 10 })
+  eq(gApi[0].role, 'system', '第一条仍是系统提示词')
+  eq(gApi[1].role, 'system', '开场白改写成 system 说明')
+  ok(gApi[1].content.indexOf('你回来啦') >= 0, '说明里保留开场白原文')
+  eq(gApi[2].role, 'user', '其后紧跟真实用户消息')
+  eq(gApi.length, 3, '不会多出一条 assistant')
+  const gOnly = buildApiMessages([greet], { maxMessages: 10 })
+  ok(gOnly.every((m) => m.role === 'system'), '只有开场白时也不发 assistant 打头')
+
   ok(summarizeUsage({ prompt_tokens: 10, completion_tokens: 5 }).indexOf('入 10') === 0, '用量摘要')
 }
 
@@ -398,7 +418,6 @@ function eq(a, b, name) {
   eq(sel.length, 2, '达到上限不再加')
   eq(removePhoto(sel, 'x').length, 1, '移除已选')
 }
-
 
 // ---------- 行内公式提升 / 纸面模式 ----------
 {
@@ -903,6 +922,13 @@ function searchSuite() {
   eq(normalizeSettings({ params: { searchCount: 99 } }).params.searchCount, 10, 'searchCount 上限钳制')
   eq(normalizeSettings({ params: { searchCount: 0 } }).params.searchCount, 1, 'searchCount 下限钳制')
 
+  // model 是动态字段：第三方供应商扫到的 id 必须能存住（否则切了又被弹回默认值）
+  eq(normalizeSettings({ params: { model: 'deepseek-v4-pro' } }).params.model, 'deepseek-v4-pro', '内置模型 id 保留')
+  eq(normalizeSettings({ params: { model: 'gpt-4o' } }).params.model, 'deepseek-flash', '未扫描的陌生 id 仍回落默认')
+  eq(normalizeSettings({ models: [{ id: 'gpt-4o' }, { id: 'qwen-max' }], params: { model: 'qwen-max' } }).params.model, 'qwen-max', '扫描列表里的第三方 id 保留')
+  eq(normalizeSettings({ models: [{ id: 'gpt-4o' }], params: { model: 'gpt-4o' } }).params.model, 'gpt-4o', '扫描列表里的 gpt-4o 保留')
+  eq(normalizeSettings({ models: [{ id: 'gpt-4o' }], params: { model: 'qwen-max' } }).params.model, 'deepseek-flash', '不在扫描列表的 id 仍回落默认')
+
   // 搜索结果数在关档时置灰
   eq(scopeOf('searchCount', { searchMode: 'off' }).active, false, '关档时结果数不生效')
   eq(scopeOf('searchCount', { searchMode: 'auto' }).active, true, '自动档时结果数生效')
@@ -1134,10 +1160,721 @@ function msgSuite() {
   eq(planEdit([], 'x'), null, '空列表修改返回 null')
 }
 
+// ---------- 设置分类 ----------
+function sectionsSuite() {
+  eq(sectionsFor('chat').length, 7, '聊天模式 7 个分类页（含地图与天气）')
+  eq(sectionsFor('role').length, 7, '扮演模式多一个人设页')
+  eq(sectionsFor('role')[0].id, 'persona', '人设页排第一')
+  // 地图只在聊天模式：扮演模式要专注角色对话，不放设备类功能
+  ok(sectionsFor('chat').some((x) => x.id === 'tool'), '聊天模式有「地图与天气」页')
+  ok(!sectionsFor('role').some((x) => x.id === 'tool'), '扮演模式没有「地图与天气」页')
+  ok(hasGroup(sectionById('chat', 'tool'), 'tool'), '地图页含 tool 分组')
+  eq(sectionStatus('tool', { hasAmapKey: false }), '未填高德 Key', '没配 Key 的地图卡片文案')
+  ok(sectionStatus('tool', { hasAmapKey: true, amapKeyMask: '148c****021a' }).indexOf('148c****021a') >= 0, '配了 Key 显示掩码')
+  eq(sectionById('role', 'nope').id, 'persona', '未知分类回落到第一个')
+  ok(hasGroup(sectionById('chat', 'talk'), 'memory'), '对话页包含记忆分组')
+  ok(!hasGroup(sectionById('chat', 'view'), 'memory'), '界面页不含记忆分组')
+
+  // 连接卡片：直接报余额和峰谷剩余时间，不再用「有余额」这种看不出数的说法
+  eq(sectionStatus('conn', { hasKey: false }), '未填 Key', '没 Key 就报没 Key')
+  eq(sectionStatus('conn', { hasKey: true }), '已填 Key · 未查余额', '有 Key 没查到余额时的文案')
+  eq(sectionStatus('conn', { hasKey: true, balanceText: '¥12.93', periodText: '距转谷 1 小时 20 分' }),
+    '¥12.93 · 距转谷 1 小时 20 分', '有余额就报数字 + 峰谷剩余')
+  ok(sectionStatus('conn', { hasKey: true, balanceText: '¥12.93' }).indexOf('有余额') < 0, '不再出现「有余额」')
+  eq(sectionStatus('talk', { memoryOn: true, memoryCount: 3 }), '记忆已开 · 3 条', '记忆卡片状态')
+  eq(sectionStatus('data', { convCount: 0 }), '还没有对话', '空对话状态')
+}
+
+// ---------- 设置档案（模式 / 人设）----------
+function profileSuite() {
+  // v1 老文件：整份就是聊天模式设置
+  const v1 = { apiKey: 'sk-123456789012', baseUrl: 'https://api.deepseek.com/v1', params: { model: 'x' }, updatedAt: 5 }
+  const d1 = normalizeDoc(v1)
+  eq(d1.version, DOC_VERSION, 'v1 文件升级到 v2 结构')
+  eq(d1.mode, 'chat', 'v1 文件默认聊天模式')
+  eq(d1.chat.apiKey, 'sk-123456789012', 'v1 的 Key 落进 chat 槽')
+  eq(d1.role.personas.length, 0, 'v1 文件没有预设人设')
+  eq(profileKey(d1), 'chat', '聊天模式档案名')
+
+  // 铺平：页面读到的就是 chat 那份
+  eq(pickProfile(d1).apiKey, 'sk-123456789012', '铺平后拿得到 Key')
+  eq(pickProfile(d1).mode, 'chat', '铺平后带模式标记')
+
+  // 写回只动当前槽
+  writeProfile(d1, Object.assign({}, pickProfile(d1), { apiKey: 'sk-new-key-000000' }))
+  eq(d1.chat.apiKey, 'sk-new-key-000000', '写回落在 chat 槽')
+
+  // 切到扮演模式：没有人设时自动建一个（否则界面会显示"没有 Key"，像坏了）
+  setMode(d1, 'role')
+  eq(d1.mode, 'role', '切到扮演模式')
+  eq(d1.role.personas.length, 1, '第一次进扮演模式自动建人设')
+  eq(d1.chat.apiKey, 'sk-new-key-000000', '建人设不影响聊天模式那份')
+
+  const p1 = d1.role.personas[0]
+  // 新建时只沿用"连接"这一段，参数 / 提示词仍是各自独立的默认值
+  eq(p1.settings.apiKey, 'sk-new-key-000000', '新人设沿用连接信息（各存一份）')
+  eq(p1.settings.params.model, 'deepseek-flash', '新人设的参数是默认值，不跟着聊天模式')
+  eq(profileKey(d1), 'role_' + p1.id, '扮演模式档案名带人设 id')
+
+  // 两个人设互不干扰
+  const id2 = addPersona(d1, { name: '小美' })
+  ok(!!id2, '新增人设返回 id')
+  eq(d1.role.personas.length, 2, '两个人设')
+  setActivePersona(d1, id2)
+  writeProfile(d1, Object.assign({}, pickProfile(d1), { apiKey: 'sk-mei-0000000000' }))
+  eq(findPersona(d1, id2).settings.apiKey, 'sk-mei-0000000000', '写入落在当前人设')
+  eq(findPersona(d1, p1.id).settings.apiKey, 'sk-new-key-000000', '另一个人设不受影响')
+
+  // 改名 / 改卡
+  ok(renamePersona(d1, id2, '阿美'), '改名成功')
+  eq(findPersona(d1, id2).name, '阿美', '名字已更新')
+  ok(!renamePersona(d1, id2, '   '), '空名字不生效')
+  ok(setPersonaCard(d1, id2, { name: '阿美', description: '温柔' }), '写角色卡')
+  eq(findPersona(d1, id2).card.description, '温柔', '角色卡字段已存')
+
+  // 「与 XX 一致」= 整包复制，之后各改各的
+  cloneProfile(d1.chat, 'role', d1)
+  eq(findPersona(d1, id2).settings.apiKey, 'sk-new-key-000000', '复制聊天模式设置到当前人设')
+  writeProfile(d1, Object.assign({}, pickProfile(d1), { apiKey: 'only-me' }))
+  eq(d1.chat.apiKey, 'sk-new-key-000000', '复制之后再改不会反向影响源')
+
+  // 上限
+  for (let i = 0; i < 20; i++) addPersona(d1, { name: 'p' + i })
+  eq(d1.role.personas.length, MAX_PERSONAS, '人设有数量上限')
+
+  // 删到最后一个人设时不允许（扮演模式没有"零人设"状态）
+  const d2 = normalizeDoc({ version: 2, mode: 'role', chat: {}, role: { activeId: 'a', personas: [{ id: 'a', name: 'A' }] } })
+  ok(!removePersona(d2, 'a'), '不能删掉最后一个人设')
+  const d3 = normalizeDoc({ version: 2, mode: 'role', chat: {}, role: { activeId: 'a', personas: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }] } })
+  ok(removePersona(d3, 'a'), '有人设可删')
+  eq(d3.role.activeId, 'b', '删掉当前人设后自动指向剩下的')
+
+  // 指向不存在的人设 → 回落到第一个
+  const d4 = normalizeDoc({ version: 2, mode: 'role', chat: {}, role: { activeId: 'zzz', personas: [{ id: 'a', name: 'A' }] } })
+  eq(d4.role.activeId, 'a', 'activeId 失效时回落')
+
+  eq(personasBrief(d3).length, 1, '人设简介列表')
+}
+
+// ---------- 人设卡 ----------
+function personaSuite() {
+  const v2 = normalizeCard({
+    spec: 'chara_card_v2', spec_version: '2.0',
+    data: { name: '小美', description: '十七岁的邻居', personality: '害羞', scenario: '夏天的走廊', first_mes: '你回来啦', mes_example: 'U: 早\nA: 早呀', creator_notes: 'x', tags: ['日常'] }
+  })
+  eq(v2.name, '小美', 'v2 角色卡取到名字')
+  eq(v2.description, '十七岁的邻居', 'v2 取到设定')
+  eq(v2.firstMessage, '你回来啦', 'v2 取到开场白(first_mes)')
+  eq(v2.exampleDialogue.indexOf('早呀') >= 0, true, 'v2 取到示例对话(mes_example)')
+
+  const flat = normalizeCard({ name: '阿强', description: '程序员' })
+  eq(flat.name, '阿强', '扁平角色卡也能读')
+  ok(cardIsEmpty({}), '空卡判空')
+  ok(!cardIsEmpty(flat), '有名字不算空')
+
+  const sys = personaSystemPrompt(v2, '不要说教')
+  ok(sys.indexOf('小美') >= 0, '系统提示词里有人名')
+  ok(sys.indexOf('夏天的走廊') >= 0, '系统提示词带日常背景')
+  ok(sys.indexOf('不要跳出角色') >= 0, '提示词保留不跳出角色')
+  ok(sys.indexOf('【日常背景】') >= 0, '场景按“日常背景”注入')
+  ok(sys.indexOf('【场景】') < 0, '不再用“场景”这个戏剧化说法')
+  ok(sys.indexOf('不写旁白') >= 0 && sys.indexOf('不描写环境') >= 0, '提示词禁止旁白与环境描写')
+  ok(sys.indexOf('不用描写') >= 0, '背景声明“不用描写”')
+  ok(sys.indexOf('不要说教') >= 0, '补充要求接在后面')
+  ok(sys.indexOf('好感度') < 0, '没写自定义规则时不会凭空出现好感度')
+
+  // ---- 自定义字段：真实卡片的灵魂，以前被静默丢掉 ----
+  const whale = parsePersonaFile(JSON.stringify({
+    spec: 'chara_card_v2', spec_version: '2.0',
+    data: {
+      name: '蓝鲸损友娘', description: '圆滚滚的蓝色小鲸鱼',
+      personality: 'x'.repeat(1246),
+      affection_rules: '初始 LV1（0/100），最高 LV5',
+      tags: ['日常'], creator: '某人', character_version: '2.0'
+    }
+  }), 'whale.json')
+  ok(whale.ok, '带自定义字段的卡能导入')
+  eq(whale.card.personality.length, 1246, '1246 字的性格不再被 1200 截断')
+  ok(whale.card.custom.indexOf('【好感度规则】') >= 0, 'affection_rules 用中文标题')
+  ok(whale.card.custom.indexOf('最高 LV5') >= 0, '好感度规则内容保留')
+  ok(whale.card.custom.indexOf('某人') < 0, 'creator 这类元数据不进提示词')
+  eq(whale.card.customKeys.join(','), 'affection_rules', '记录自定义键名')
+  const wsys = personaSystemPrompt(whale.card)
+  ok(wsys.indexOf('最高 LV5') >= 0, '好感度规则进了系统提示词')
+  ok(wsys.indexOf('不写旁白') >= 0, '陪伴约束仍在')
+
+  const cat = normalizeCard({
+    name: '魅魔猫娘',
+    personality_tags: ['PLAYFUL', 'CATLIKE'],
+    roleplay_rules: { identity: '成年魅魔猫娘', catlike_behavior: true, mandatory_suffix: '主人~' },
+    timeout_signal: { trigger: 'TIMEOUT_SIGNAL', behavior: '立即暂停' }
+  })
+  ok(cat.custom.indexOf('PLAYFUL、CATLIKE') >= 0, '数组用顿号展开')
+  ok(cat.custom.indexOf('identity：成年魅魔猫娘') >= 0, '对象拆成 子键：值')
+  ok(cat.custom.indexOf('catlike_behavior：是') >= 0, '布尔转中文')
+  ok(cat.custom.indexOf('【扮演规则】') >= 0, 'roleplay_rules 有中文标题')
+  ok(cat.custom.indexOf('【暂停信号】') >= 0, 'timeout_signal 有中文标题')
+
+  const twice = normalizeCard(cat)
+  eq(twice.custom, cat.custom, '重复归一化不会把自定义块套两层')
+  eq(twice.customKeys.join(','), cat.customKeys.join(','), '重复归一化保留键名清单')
+
+  const outCard = buildPersonaCardDoc(whale.card)
+  eq(outCard.data.custom_rules, whale.card.custom, '导出带 custom_rules')
+  const backCard = parsePersonaFile(JSON.stringify(outCard), 'w.json')
+  eq(backCard.card.custom, whale.card.custom, '导出再导入不丢自定义规则')
+
+  eq(greetingOf(v2), '你回来啦', '开场白取得到')
+  eq(greetingOf({}), '', '没填开场白就是空')
+  eq(CARD_ROWS.filter((r) => r.key === 'scenario')[0].label, '日常背景', '编辑行叫“日常背景”')
+
+  eq(nameFromFile('/userdisk/a/温柔学姐_v2.json'), '温柔学姐 v2', '文件名转名字')
+  eq(nameFromFile('prompt.md'), 'prompt', '去掉扩展名')
+
+  const p = parsePersonaFile('你是一个猫娘，说话带喵。', 'cat.txt')
+  ok(p.ok, '文本提示词可解析')
+  eq(p.kind, 'prompt', '识别为提示词')
+  eq(p.card.name, 'cat', '名字取文件名')
+  ok(p.card.description.indexOf('猫娘') >= 0, '正文进设定')
+
+  const j = parsePersonaFile(JSON.stringify({ spec: 'chara_card_v2', data: { name: '阿花', description: '卖花' } }), 'a.json')
+  ok(j.ok, 'JSON 角色卡可解析')
+  eq(j.card.name, '阿花', 'JSON 角色卡名字')
+
+  ok(!parsePersonaFile('not json', 'x.json').ok, '坏 JSON 报错')
+  ok(!parsePersonaFile('x', 'x.png').ok, '不支持的扩展名报错')
+}
+
+// ---------- 上下文压缩与记忆 ----------
+function memorySuite() {
+  const m = normalizeMemory(null)
+  eq(m.on, true, '记忆默认开启')
+  eq(m.lines, MEMORY_DEFAULT.lines, '默认条数')
+  eq(normalizeMemory({ on: false, lines: 999 }).lines, 60, '条数上限钳位')
+  eq(normalizeMemory({ lines: 1 }).lines, 6, '条数下限钳位')
+  eq(normalizeMemory({ on: false }).on, false, '显式关掉才关')
+
+  const msgs = []
+  for (let i = 0; i < 6; i++) {
+    msgs.push({ id: 'u' + i, role: 'user', content: '问' + i + ' ' + 'x'.repeat(200), createdAt: i })
+    msgs.push({ id: 'a' + i, role: 'assistant', content: '答' + i + ' ' + 'y'.repeat(300), createdAt: i })
+  }
+  const e = memoryEntry(msgs[0])
+  eq(e.role, 'user', '摘要条目记角色')
+  ok(e.text.length <= 61, '用户那句摘要截断到 60 字')
+  eq(memoryEntry({ id: 'z', role: 'assistant', content: '', error: 'x' }), null, '报错/空消息不进记忆')
+
+  const f1 = foldMessages([], msgs, { lines: 24 })
+  eq(f1.added, 12, '一批消息全部折进记忆')
+  eq(f1.notes.length, 12, '记忆条数')
+  // 再折一次：按 id 去重，不会翻倍
+  const f2 = foldMessages(f1.notes, msgs, { lines: 24 })
+  eq(f2.added, 0, '同一条消息不会重复记忆')
+  // 超上限丢最旧的
+  const f3 = foldMessages(f1.notes, [{ id: 'new1', role: 'user', content: '新的话' }], { lines: 6 })
+  eq(f3.notes.length, 6, '记忆条数被裁到上限')
+  eq(f3.notes[5].id, 'new1', '保留的是最新那条')
+
+  const text = memoryText(f1.notes)
+  ok(text.indexOf('我：问0') >= 0, '记忆正文带"我："前缀')
+  ok(text.indexOf('AI：答0') >= 0, '记忆正文带"AI："前缀')
+  eq(memoryText([]), '', '没有记忆时返回空串')
+
+  const sum = memorySummary(f1.notes)
+  eq(sum.count, 12, '统计条数')
+  ok(sum.chars > 0, '统计字数')
+
+  // 压缩计划：超出窗口的部分才是要折叠的
+  const plan = planCompression(msgs, 4, true)
+  eq(plan.keep.length, 4, '保留窗口内的消息')
+  eq(plan.drop.length, 8, '窗口外的消息进折叠')
+  const off = planCompression(msgs, 4, false)
+  eq(off.drop.length, 0, '记忆关掉时不产生折叠')
+  eq(off.keep.length, 4, '记忆关掉时仍然按窗口截断')
+  // pending / 报错消息不参与
+  const withBad = msgs.slice(0, 3).concat([{ id: 'p', role: 'assistant', content: '', pending: true }])
+  eq(planCompression(withBad, 10, true).keep.length, 3, 'pending 消息不计入')
+  // maxHistory=0 是合法设置：一条历史都不带，全部折叠
+  const zero = planCompression(msgs, 0, true)
+  eq(zero.keep.length, 0, 'maxHistory=0 时不带任何历史')
+  eq(zero.drop.length, 12, 'maxHistory=0 时全部进折叠')
+  eq(pruneNotes([{ id: 'a', text: 'x' }, { text: 'no id' }], 10).length, 1, '没有 id 的条目被丢掉')
+
+  // 清空记忆的水位：更早的消息不再折回来
+  const timed = [{ id: 'o1', createdAt: 100 }, { id: 'o2', createdAt: 200 }, { id: 'n1', createdAt: 300 }]
+  eq(notesAfter(timed, 0).length, 3, '没清空过（floor=0）时全部参与折叠')
+  eq(notesAfter(timed, 200).length, 1, '水位当刻及更早的消息被挡掉')
+  eq(notesAfter(timed, 200)[0].id, 'n1', '只留下水位之后的消息')
+  eq(notesAfter(null, 200).length, 0, '空列表不炸')
+  eq(notesAfter([{ id: 'x' }], 200).length, 0, '没有 createdAt 的当作最旧')
+}
+
+// ---------- 存档导出 / 导入 ----------
+function archiveSuite() {
+  const settings = {
+    apiKey: 'sk-archive-000000', baseUrl: 'https://api.deepseek.com/v1', systemPrompt: '你是助手',
+    maxHistory: 8, saveMode: 'auto', showBalance: false, sourceStyle: 'full',
+    memory: { on: true, lines: 30 }, params: { model: 'deepseek-flash', thinking: true }
+  }
+  const convs = [{
+    id: 'c1', title: '你好', createdAt: 1000, updatedAt: 2000,
+    messages: [
+      { id: 'u1', role: 'user', content: '在吗', createdAt: 1001 },
+      { id: 'a1', role: 'assistant', content: '在', reasoning: '思考', createdAt: 1002 },
+      { id: 'a2', role: 'assistant', content: '', pending: true, createdAt: 1003 }
+    ]
+  }]
+  const notes = [{ id: 'u0', at: 900, role: 'user', text: '更早的话' }]
+
+  const sd = buildSettingsDoc({ at: 1761000000000, mode: 'role', personaId: 'p_a', personaName: '小美', card: { name: '小美' }, settings: settings })
+  eq(sd.version, 1, '存档带版本号')
+  ok(!!sd.exportDate, '存档带 exportDate')
+  eq(detectKind(sd), 'settings', '设置档可被识别')
+  const sp = parseSettingsArchive(JSON.stringify(sd))
+  ok(sp.ok, '设置档可解析')
+  eq(sp.settings.apiKey, 'sk-archive-000000', 'Key 往返一致（备份就是要能恢复）')
+  eq(sp.settings.maxHistory, 8, '数值字段往返')
+  eq(sp.settings.memory.lines, 30, '记忆设置往返')
+  eq(sp.settings.params.model, 'deepseek-flash', '参数往返')
+  eq(sp.name, '小美', '人设名往返')
+
+  const rd = buildRecordsDoc({
+    at: 1761000000000, mode: 'role', personaId: 'p_a', personaName: '小美',
+    card: { name: '小美' }, settings: settings, personaPrompt: '扮演小美', convs: convs, notes: notes
+  })
+  eq(detectKind(rd), 'records', '记录档可被识别')
+  eq(rd.data.gameData.playerProgress.conversationCount, 1, '记录档统计对话数')
+  eq(rd.data.gameData.playerProgress.messageCount, 2, '记录档统计消息数（跳过 pending）')
+  ok(rd.data.gameData.timeSystem.updatedAt > 0, '记录档带时间系统')
+  ok(rd.data.gameData.prompts.persona.indexOf('扮演') >= 0, '记录档带人设提示词')
+  // 需求明确：不要人物数值类字段
+  ok(!rd.data.gameData.characterStats, '记录档没有 characterStats')
+  ok(JSON.stringify(rd.data.gameData).indexOf('favorability') < 0, '记录档没有好感度')
+  ok(JSON.stringify(rd.data).indexOf('inventory') < 0, '记录档没有背包/商店')
+
+  const rp = parseRecordsArchive(JSON.stringify(rd))
+  ok(rp.ok, '记录档可解析')
+  eq(rp.convs.length, 1, '记录档对话数往返')
+  eq(rp.convs[0].messages.length, 2, '记录档消息数往返')
+  eq(rp.convs[0].messages[1].reasoning, '思考', '思考过程往返')
+  eq(rp.notes.length, 1, '记忆往返')
+  eq(rp.card.name, '小美', '记录档里也带角色卡')
+
+  const info = archiveSummary(rd)
+  eq(info.kind, 'records', '简介识别类型')
+  eq(info.sessions, 1, '简介带对话数')
+  eq(info.messages, 2, '简介带消息数')
+
+  eq(profileFolder('chat'), 'chat', '聊天模式导出目录名')
+  ok(profileFolder('role_p_abc123', '小美').indexOf('小美') === 0, '人设目录名带人设名')
+  ok(stampText(1761000000000).length >= 16, '时间戳可读')
+
+  // 人设卡导出：能拷走、能导回来
+  const cd = buildPersonaCardDoc({ name: '小美', description: '隔壁的猫', personality: '懒', firstMessage: '喵', exampleDialogue: 'u:hi' })
+  eq(cd.spec, 'chara_card_v2', '人设卡用社区通用格式')
+  eq(cd.data.first_mes, '喵', '开场白写成 first_mes')
+  eq(cd.data.mes_example, 'u:hi', '对话示例写成 mes_example')
+  ok(cd.data.creator_notes.length > 0, '导出时补一条来源说明')
+  const back = parsePersonaFile(JSON.stringify(cd), '小美.json')
+  ok(back.ok, '导出的文件能被导入解析')
+  eq(back.name, '小美', '导出→导入名字不变')
+  eq(back.card.description, '隔壁的猫', '导出→导入设定不变')
+  eq(back.card.firstMessage, '喵', '导出→导入开场白不变')
+
+  eq(personaFileName('小 美/1'), '小_美_1.json', '文件名去掉路径符号、保留中文')
+  eq(personaFileName(''), 'persona.json', '空名字有兜底')
+  const sample = buildPersonaSampleDoc(1761000000000)
+  ok(parsePersonaFile(JSON.stringify(sample), 'sample_card.json').ok, '示例文件本身就能被导入')
+  ok(sample.data.creator_notes.indexOf('import') >= 0, '示例里写了导入路径')
+
+  // 导出根目录必须在 Favorite 下：这是连电脑后用户唯一不用记应用名就能找到的地方
+  // （注意设备上是首字母大写的 Favorite，路径大小写敏感）；
+  // 外面还要套一层应用名，三个子目录别直接铺在系统的 Favorite 根上
+  eq(ROOT_DIR, '/userdisk/Favorite/deepseek-pen', '导出根目录是 Favorite/deepseek-pen')
+  eq(EXPORT_DIR, '/userdisk/Favorite/deepseek-pen/export', '存档目录在应用目录/export')
+  eq(IMPORT_DIR, '/userdisk/Favorite/deepseek-pen/import', '导入目录在应用目录/import')
+  eq(PERSONA_DIR, '/userdisk/Favorite/deepseek-pen/persona', '人设目录在应用目录/persona')
+  ok(sample.data.creator_notes.indexOf('/userdisk/Favorite/deepseek-pen/import/') >= 0, '示例里的导入路径与常量一致')
+
+  // 垃圾输入不能抛
+  ok(!parseSettingsArchive('not json').ok, '坏 JSON 报错')
+  ok(!parseSettingsArchive(JSON.stringify({ a: 1 })).ok, '不认识的 JSON 报错')
+  ok(!parseRecordsArchive(JSON.stringify(sd)).ok, '把设置档当记录档导入会报错')
+}
+
+profileSuite()
+personaSuite()
+memorySuite()
+archiveSuite()
+sectionsSuite()
+
 msgSuite()
 
-
 searchSuite()
+
+// ---------- 高德地图 ----------
+function amapSuite() {
+  eq(AMAP_BASE, 'https://restapi.amap.com/v3', '高德 base')
+
+  // Key 就绪判断
+  ok(amapReady('0123456789abcdef0123456789abcdef'), '32位Key判为就绪')
+  ok(!amapReady('abc'), '短Key判为没填')
+  ok(!amapReady(''), '空串判为没填')
+  ok(!amapReady(null), 'null 不抛')
+  eq(amapKeyOf('  kk  '), 'kk', 'Key 去空格')
+
+  // URL 拼接：空参数不带出去，中文要编码
+  const u1 = placeSearchUrl({ key: 'K', keywords: '天安门', city: '北京', offset: 5 })
+  ok(u1.indexOf('/place/text?') > 0, '地点搜索走 place/text')
+  ok(u1.indexOf('keywords=%E5%A4%A9%E5%AE%89%E9%97%A8') > 0, '中文关键词被编码')
+  ok(u1.indexOf('city=%E5%8C%97%E4%BA%AC') > 0, '城市被编码')
+  ok(u1.indexOf('offset=5') > 0, 'offset 透传')
+  ok(u1.indexOf('key=K') > 0, 'key 透传')
+  ok(u1.indexOf('extensions=base') > 0, '默认只要 base 扩展')
+
+  const u2 = placeSearchUrl({ key: 'K', keywords: 'x' })
+  ok(u2.indexOf('city=') < 0, '没传 city 就不带空参')
+  ok(u2.indexOf('offset=10') > 0, 'offset 默认 10')
+  ok(u2.indexOf('page=1') > 0, 'page 默认 1')
+
+  // 越界值要夹住，不把错误参数发给服务端
+  const u3 = placeSearchUrl({ key: 'K', keywords: 'x', offset: 999, page: 0 })
+  ok(u3.indexOf('offset=25') > 0, 'offset 上限 25')
+  ok(u3.indexOf('page=1') > 0, 'page 下限 1')
+
+  // 周边搜索必须有 location，radius 有默认
+  const u4 = placeAroundUrl({ key: 'K', location: '116.3,39.9', keywords: '咖啡' })
+  ok(u4.indexOf('/place/around') > 0, '周边搜索走 place/around')
+  ok(u4.indexOf('location=116.3%2C39.9') > 0, '坐标逗号被编码')
+  ok(u4.indexOf('radius=3000') > 0, 'radius 默认 3000')
+
+  // 天气：实时 vs 预报是同一个接口不同 extensions
+  const uw = weatherUrl({ key: 'K', city: '110000' })
+  ok(uw.indexOf('/weather/weatherInfo') > 0, '天气接口路径')
+  ok(uw.indexOf('extensions=base') > 0, '实时天气用 base')
+  const uwf = weatherUrl({ key: 'K', city: '110000', forecast: true })
+  ok(uwf.indexOf('extensions=all') > 0, '预报用 all')
+
+  // 地理编码 / 逆地理 / 驾车
+  ok(geocodeUrl({ key: 'K', address: '中关村' }).indexOf('/geocode/geo') > 0, '地理编码路径')
+  ok(regeoUrl({ key: 'K', location: '116.3,39.9' }).indexOf('/geocode/regeo') > 0, '逆地理路径')
+  ok(drivingUrl({ key: 'K', origin: 'a', destination: 'b' }).indexOf('/direction/driving') > 0, '驾车路径')
+
+  // 解析：成功
+  const okBody = JSON.stringify({
+    status: '1', count: '2', info: 'OK', infocode: '10000',
+    pois: [
+      { id: 'B1', name: '天安门', address: '长安街北侧', type: '风景名胜;风景名胜;国家级景点', tel: '010-1', cityname: '北京市', adname: '东城区', location: '116.397463,39.909187' },
+      { id: 'B2', name: '天安门广场', address: '东长安街', type: '风景名胜;公园广场;城市广场', location: '116.397755,39.903182', distance: '320' }
+    ]
+  })
+  const r1 = parseAmap(okBody)
+  ok(r1.ok, 'status:"1" 判成功')
+  eq(r1.error, '', '成功时无错误文案')
+  // 契约：成功时解析结果在 obj 里（不是 data）。services 层把 data 当解析结果用过一次，
+  // 症状是"Key 能用但没数据"，查了半天 —— 这条断言就是为了钉住这个字段名
+  ok(!!r1.obj && Array.isArray(r1.obj.pois), 'parseAmap 成功时结果在 obj 字段')
+  eq(r1.data, undefined, 'parseAmap 没有 data 字段（别记错名字）')
+  const pois = poiList(r1.obj)
+  eq(pois.length, 2, '解析出两个 POI')
+  eq(pois[0].name, '天安门', 'POI 名称')
+  eq(pois[0].lng, '116.397463', '经度拆出来（lng 在前）')
+  eq(pois[0].lat, '39.909187', '纬度拆出来')
+  eq(pois[0].type, '国家级景点', 'type 取最后一级')
+  eq(pois[1].distance, '320', '周边搜索的 distance 保留')
+  eq(pois[0].distance, '', '没有 distance 时给空串')
+  eq(pois[0].city, '北京市', '城市名')
+
+  // 解析：失败（HTTP 200 + status 0，这是高德最容易踩的坑）
+  const badBody = JSON.stringify({ status: '0', info: 'INVALID_USER_KEY', infocode: '10001' })
+  const r2 = parseAmap(badBody)
+  ok(!r2.ok, 'status:"0" 判失败')
+  ok(r2.error.indexOf('Key 无效') >= 0, '10001 转成人话')
+  eq(amapErrorText('10003'), '今日配额已用完，明天 0 点恢复（个人开发者额度较小）', '10003 配额文案')
+  ok(amapErrorText('10009').indexOf('Web服务') >= 0, '10009 提示要用 Web服务 Key')
+  ok(amapErrorText('99999', 'WHATEVER').indexOf('WHATEVER') >= 0, '未知码带上原文')
+  ok(amapErrorText('', '').indexOf('未知') >= 0, '全空也不崩')
+  ok(!!AMAP_CODES['10002'], '错误码表有 10002')
+
+  // 解析：脏输入
+  ok(!parseAmap('').ok, '空 body 报错')
+  ok(!parseAmap('not json').ok, '非 JSON 报错')
+  ok(!parseAmap('<html>502</html>').ok, 'HTML 网关页识别出来')
+  ok(parseAmap('<html>502</html>').error.indexOf('网关') >= 0, 'HTML 给网关提示')
+  ok(!parseAmap('null').ok, 'null 报错')
+  ok(!parseAmap('[1,2]').ok, '数组当响应报错')
+
+  // 天气解析
+  const wBody = JSON.stringify({
+    status: '1', count: '1', info: 'OK', infocode: '10000',
+    lives: [{ province: '北京', city: '北京市', adcode: '110000', weather: '晴', temperature: '13', winddirection: '北', windpower: '≤3', humidity: '24', reporttime: '2026-10-30 22:39:20' }]
+  })
+  const w = weatherNow(parseAmap(wBody).obj)
+  eq(w.city, '北京市', '天气城市')
+  eq(w.weather, '晴', '天气现象')
+  eq(w.temperature, '13', '温度是字符串（高德全是字符串）')
+  eq(weatherLine(w), '北京市 晴 13°C', '天气一句话')
+  const wrows = weatherRows(w)
+  ok(wrows.length >= 4, '天气详情行数')
+  eq(wrows[0].label, '天气', '第一行是天气')
+  ok(wrows[1].value.indexOf('级') > 0, '风力带"级"')
+  ok(wrows[2].value.indexOf('%') > 0, '湿度带百分号')
+  eq(weatherNow({ status: '1' }), null, '没有 lives 返回 null')
+  eq(weatherNow(null), null, 'null 不抛')
+
+  // 预报解析
+  const fBody = JSON.stringify({
+    status: '1', forecasts: [{ city: '北京市', casts: [
+      { date: '2026-10-31', dayweather: '晴', nightweather: '多云', daytemp: '18', nighttemp: '6', daywind: '北风', daypower: '3' },
+      { date: '2026-11-01', dayweather: '阴', nightweather: '小雨', daytemp: '15', nighttemp: '8', daywind: '东风', daypower: '2' }
+    ] }]
+  })
+  const fc = weatherForecast(parseAmap(fBody).obj)
+  eq(fc.length, 2, '两天预报')
+  eq(fc[0].dayWeather, '晴', '白天天气')
+  eq(fc[0].nightTemp, '6', '夜间温度')
+
+  // 地理编码 / 逆地理 / 路线
+  const g = geocodeFirst(parseAmap(JSON.stringify({ status: '1', geocodes: [{ formatted_address: '北京市海淀区中关村', province: '北京市', city: '北京市', district: '海淀区', level: '兴趣点', location: '116.31,39.98' }] })).obj)
+  eq(g.address, '北京市海淀区中关村', '地理编码地址')
+  eq(g.lat, '39.98', '地理编码纬度')
+  eq(geocodeFirst({ status: '1', geocodes: [] }), null, '没有结果返回 null')
+
+  const rg = regeoText(parseAmap(JSON.stringify({ status: '1', regeocode: { formatted_address: '北京市海淀区xx路1号', addressComponent: { province: '北京市', city: '北京市', district: '海淀区', township: '中关村街道' } } })).obj)
+  eq(rg.district, '海淀区', '逆地理区县')
+  eq(regeoText({ status: '1' }), null, '没有 regeocode 返回 null')
+
+  const rt = routeBrief(parseAmap(JSON.stringify({ status: '1', route: { paths: [{ distance: '12000', duration: '1800', steps: [{ instruction: '向东行驶', road: '长安街', distance: '500' }, { instruction: '右转', road: 'x路', distance: '300' }, { instruction: '到达', road: '', distance: '0' }, { instruction: '第四步', road: '', distance: '0' }] }] } })).obj, 3)
+  eq(rt.distance, '12000', '路线总距离')
+  eq(rt.steps.length, 3, '只留三步（屏幕放不下更多）')
+  eq(rt.stepCount, 4, '但记录总步数')
+  eq(routeBrief({ status: '1', route: { paths: [] } }), null, '没路线返回 null')
+
+  // 格式化
+  eq(fmtDistance('800'), '800m', '米级距离')
+  eq(fmtDistance('1500'), '1.5km', '公里级距离')
+  eq(fmtDistance('0'), '', '0 距离不显示')
+  eq(fmtDistance(''), '', '空距离不显示')
+  eq(fmtDistance('abc'), '', '非法距离不显示')
+  eq(fmtDuration('1300'), '22分钟', '分钟级时长')
+  eq(fmtDuration('4500'), '1小时15分钟', '小时级时长')
+  eq(fmtDuration('3600'), '1小时', '整小时不带分钟')
+  eq(fmtDuration('0'), '', '0 时长不显示')
+
+  // 副标题：距离优先
+  eq(poiSubtitle({ distance: '320', address: '东长安街' }), '320m · 东长安街', '有距离有地址')
+  eq(poiSubtitle({ distance: '320' }), '320m', '只有距离')
+  eq(poiSubtitle({ address: '东长安街' }), '东长安街', '只有地址')
+  eq(poiSubtitle({ district: '东城区', type: '景点' }), '东城区 · 景点', '都没有就用区县+类型')
+  eq(poiSubtitle({}), '', '空对象给空串')
+}
+
+
+// ---------- 聊天里的地图意图（lib/mapintent.js）----------
+function mapIntentSuite() {
+  // 强制触发：用户明确说「使用高德地图」时必须查
+  const f1 = parseMapIntent('使用高德地图 北京天气')
+  ok(f1.forced, '「使用高德地图」判为强制')
+  eq(f1.kind, 'weather', '强制 + 北京天气 → 天气意图')
+  eq(f1.city, '北京', '强制语句里认出城市')
+  const f2 = parseMapIntent('高德地图 上海天气')
+  ok(f2.forced, '句首「高德地图」也判为强制')
+  eq(f2.city, '上海', '句首式强制也认城市')
+  const f3 = parseMapIntent('用高德地图查一下天安门')
+  ok(f3.forced, '「用高德地图」判为强制')
+  eq(f3.kind, 'place', '强制但无明确意图 → 地点搜索')
+  eq(f3.keywords, '天安门', '强制语句剥掉「查一下」再当关键词')
+
+  // 不能误触发：「高德地图和百度地图哪个好」是在提问，不是指令
+  eq(parseMapIntent('高德地图和百度地图哪个好').kind, 'none', '比较类提问不触发地图')
+  ok(!parseMapIntent('高德地图和百度地图哪个好').forced, '比较类提问不算强制')
+
+  // 天气
+  const w1 = parseMapIntent('北京天气怎么样')
+  eq(w1.kind, 'weather', '「北京天气怎么样」→ 天气')
+  eq(w1.city, '北京', '认出北京')
+  ok(!w1.forecast, '没提时间 → 实时天气')
+  const w2 = parseMapIntent('上海明天会下雨吗')
+  eq(w2.kind, 'weather', '「明天会下雨吗」→ 天气')
+  ok(w2.forecast, '提到明天 → 预报')
+  const w3 = parseMapIntent('杭州未来一周天气')
+  eq(w3.city, '杭州', '认出杭州')
+  ok(w3.forecast, '「未来一周」→ 预报')
+  const w4 = parseMapIntent('今天天气怎么样')
+  eq(w4.kind, 'weather', '没城市也判天气（靠 IP 兜底）')
+  eq(w4.city, '', '没城市时 city 留空')
+  eq(parseMapIntent('最近天气不错').kind, 'none', '「天气不错」是感慨，不查')
+
+  // 路线
+  const r1 = parseMapIntent('从北京到上海怎么走')
+  eq(r1.kind, 'route', '「从A到B怎么走」→ 路线')
+  eq(r1.origin, '北京', '路线起点')
+  eq(r1.destination, '上海', '路线终点')
+  const r2 = parseMapIntent('北京到上海开车要多久')
+  eq(r2.kind, 'route', '「A到B开车要多久」→ 路线')
+  eq(r2.origin, '北京', '起点不带「从」也能拆')
+  eq(r2.destination, '上海', '终点不带「怎么走」也能拆')
+  const r3 = parseMapIntent('我想从杭州到南京开车要多久')
+  eq(r3.origin, '杭州', '长句里拆起点')
+  eq(r3.destination, '南京', '长句里拆终点，不把「开车」吃进地名')
+  const r4 = parseMapIntent('去杭州怎么走')
+  eq(r4.kind, 'route', '只有终点也算路线意图')
+  eq(r4.destination, '杭州', '只有终点时 destination 有值')
+  eq(r4.origin, '', '只有终点时 origin 为空（服务层会提示）')
+
+  // 地点
+  const p1 = parseMapIntent('附近的咖啡店')
+  eq(p1.kind, 'place', '「附近的X」→ 地点')
+  eq(p1.keywords, '咖啡店', '剥掉「附近的」')
+  const p2 = parseMapIntent('天安门在哪')
+  eq(p2.kind, 'place', '「X在哪」→ 地点')
+  eq(p2.keywords, '天安门', '地点关键词')
+  eq(p2.city, '', '「天安门在哪」不能把整句当城市（否则搜不到）')
+  const p3 = parseMapIntent('哪里有加油站')
+  eq(p3.keywords, '加油站', '「哪里有X」剥前缀')
+
+  // 坐标 / 经纬度
+  const g1 = parseMapIntent('116.397,39.908 这里是哪')
+  eq(g1.kind, 'regeo', '纯坐标 → 逆地理')
+  eq(g1.location, '116.397,39.908', '坐标原样取出')
+  const g2 = parseMapIntent('天安门的经纬度')
+  eq(g2.kind, 'geocode', '「X的经纬度」→ 地理编码')
+  eq(g2.address, '天安门', '剥掉「的经纬度」')
+
+  // 不该触发的日常对话
+  eq(parseMapIntent('你好').kind, 'none', '寒暄不触发')
+  eq(parseMapIntent('帮我翻译这段话').kind, 'none', '翻译请求不触发')
+  eq(parseMapIntent('北京').kind, 'none', '孤零零的地名不触发（太容易误判）')
+  eq(parseMapIntent('').kind, 'none', '空串不触发')
+  eq(parseMapIntent(null).kind, 'none', 'null 不抛')
+
+  // pickCity 的两种模式
+  eq(pickCity('北京天气', true), '北京', 'loose 认出城市表里的城市')
+  eq(pickCity('乌鲁木齐天气', true), '乌鲁木齐', 'loose 认后缀表')
+  eq(pickCity('天安门在哪', false), '', 'strict 不把疑问句当城市')
+  eq(pickCity('哈尔滨气温', true), '哈尔滨', 'loose 认前缀城市')
+
+  // 上下文格式：必须带上真实数据，且明确要求模型别编
+  const ctx = formatMapContext('weather', {
+    now: { city: '北京市', weather: '晴', temperature: '13', windDirection: '东南', windPower: '2', humidity: '24', reportTime: '2026-10-30 23:00' },
+    forecast: [],
+    cityText: '北京'
+  })
+  ok(ctx.indexOf('北京市') >= 0, '天气上下文含城市')
+  ok(ctx.indexOf('13') >= 0, '天气上下文含温度')
+  ok(ctx.indexOf('不要凭记忆') >= 0, '上下文里有"别编"的要求')
+  const fcCtx = formatMapContext('weather', { forecast: [{ date: '2026-10-31', dayWeather: '多云', nightWeather: '晴', dayTemp: '18', nightTemp: '8', dayWind: '东', dayPower: '3' }] })
+  ok(fcCtx.indexOf('2026-10-31') >= 0, '预报上下文含日期')
+  const placeCtx = formatMapContext('place', { items: [{ name: '天安门', type: '景点', district: '东城区', address: '东长安街', tel: '', lng: '116.39', lat: '39.90' }] })
+  ok(placeCtx.indexOf('天安门') >= 0, '地点上下文含名称')
+  ok(placeCtx.indexOf('东长安街') >= 0, '地点上下文含地址')
+  const routeCtx = formatMapContext('route', {
+    route: { distance: '1200', duration: '4800', steps: [{ instruction: '向东行驶', road: '长安街', distance: '300' }], stepCount: 1 },
+    originText: '北京市', destText: '上海市', distanceText: '1.2km', durationText: '1小时20分钟'
+  })
+  ok(routeCtx.indexOf('1.2km') >= 0, '路线上下文含距离')
+  ok(routeCtx.indexOf('向东行驶') >= 0, '路线上下文含第一步')
+  // brief：界面展开用，不带「回答要求」
+  const brief = formatMapContext('place', { items: [{ name: '天安门' }] }, { brief: true })
+  ok(brief.indexOf('天安门') >= 0, 'brief 仍含数据')
+  eq(brief.indexOf('回答要求'), -1, 'brief 不带回答要求')
+  // 空数据返回空串（调用方据此判断"没查到"
+  eq(formatMapContext('weather', { now: null, forecast: [] }), '', '没数据时上下文为空')
+  eq(formatMapContext('none', null), '', '未知类型为空')
+
+  // 界面标签
+  eq(mapChipLabel('weather', { now: { city: '北京市', weather: '晴', temperature: '13' } }), '高德 · 北京市 晴 13°C', '天气标签带城市/天气/温度')
+  eq(mapChipLabel('weather', { forecast: [{}, {}], cityText: '北京' }), '高德 · 北京 预报 2 天', '预报标签带天数')
+  eq(mapChipLabel('place', { items: [1, 2, 3] }), '高德 · 地点 3 条', '地点标签带条数')
+  eq(mapChipLabel('route', { distanceText: '1.2km', durationText: '20分钟' }), '高德 · 1.2km 20分钟', '路线标签带距离时长')
+  eq(mapChipLabel('geocode', {}), '高德 · 坐标', '地理编码标签')
+  eq(mapChipLabel('regeo', {}), '高德 · 地址', '逆地理标签')
+}
+
+amapSuite()
+
+mapIntentSuite()
+
+// ---------- 多分辨率自适应（fit） ----------
+{
+  // 基准机：scale=1 → 不缩放，viewPort 保持设计宽，零变化
+  {
+    const p = plan({ width: 936, height: 280 })
+    eq(p.ok, true, 'fit 基准机 ok')
+    eq(p.apply, false, 'fit 基准机不缩放')
+    eq(p.viewPort, 936, 'fit 基准机 viewPort=936')
+    eq(p.scale, 1, 'fit 基准机 scale=1')
+    eq(p.contentW, 936, 'fit 基准机 contentW=936')
+    eq(p.contentH, 280, 'fit 基准机 contentH=280')
+  }
+
+  // 更扁的机型 960×266（PStore 明确点名）：必须缩放，两个方向都装得下
+  {
+    const p = plan({ width: 960, height: 266 })
+    eq(p.ok, true, 'fit 960×266 ok')
+    eq(p.apply, true, 'fit 960×266 要缩放')
+    ok(p.scale < 1, 'fit 960×266 scale<1 (' + p.scale + ')')
+    ok(p.contentW <= 960 + 1, 'fit 960×266 宽装得下 (' + p.contentW + ')')
+    ok(p.contentH <= 266 + 1, 'fit 960×266 高装得下 (' + p.contentH + ')')
+  }
+
+  // 长边归一：宽高颠倒也能算对
+  {
+    const a = plan({ width: 280, height: 936 })
+    const b = plan({ width: 936, height: 280 })
+    eq(a.viewPort, b.viewPort, 'fit 宽高颠倒结果一致')
+    eq(a.scale, b.scale, 'fit 宽高颠倒 scale 一致')
+  }
+
+  // 归一化函数本身
+  {
+    eq(normalizeScreen(936, 280).w, 936, 'normalizeScreen 长边当宽 1')
+    eq(normalizeScreen(280, 936).w, 936, 'normalizeScreen 长边当宽 2')
+    eq(normalizeScreen(280, 936).h, 280, 'normalizeScreen 短边当高')
+  }
+
+  // 守卫：脏值退回
+  {
+    eq(isSaneScreen(0, 0), false, 'fit 0×0 脏值')
+    eq(isSaneScreen(100, 30), false, 'fit 过小脏值')
+    eq(isSaneScreen(2000, 100), false, 'fit 比例过扁脏值 (>6.7)')
+    eq(isSaneScreen(936, 280), true, 'fit 基准机合法')
+    eq(plan({ width: 0, height: 0 }).apply, false, 'fit 未知屏不缩放')
+    eq(plan({}).ok, false, 'fit 空 env 返回 not-ok')
+    eq(plan(null).ok, false, 'fit null env 返回 not-ok')
+    eq(fitViewport(0, 0), null, 'fitViewport 脏值返回 null')
+  }
+
+  // 机型矩阵：每一条都断言「缩放后两个方向都装得下 + 至少贴住一条边 + 内容宽=设计宽按 scale 缩出」
+  {
+    const matrix = [
+      [936, 280], [960, 266], [1024, 300], [960, 280], [800, 280],
+      [800, 480], [640, 480], [400, 300]
+    ]
+    for (const [w, h] of matrix) {
+      const p = plan({ width: w, height: h })
+      const label = 'fit 矩阵 ' + w + '×' + h
+      eq(p.ok, true, label + ' ok')
+      // 断言用归一化后的真实宽高（p.w/p.h），不用原始输入：长边当宽后竖装横用也等价
+      const W = p.w
+      const H = p.h
+      // ① 两个方向都装得下设计稿
+      ok(p.contentW <= W + 1, label + ' 宽装得下 (cw=' + p.contentW + ')')
+      ok(p.contentH <= H + 1, label + ' 高装得下 (ch=' + p.contentH + ')')
+      // ② 至少贴住一条边（别白缩）：宽或高至少一个接近满
+      const gapW = W - p.contentW
+      const gapH = H - p.contentH
+      ok(gapW < 2 || gapH < 2, label + ' 至少贴住一条边 (gapW=' + r2(gapW) + ', gapH=' + r2(gapH) + ')')
+      // ③ contentW/scale ≈ 设计宽（证明 contentW 确实是 936 按 scale 等比缩出来的）
+      ok(Math.abs(p.contentW / p.scale - DESIGN_W) < 2, label + ' contentW/scale≈设计宽')
+    }
+  }
+}
+
+function r2(n) {
+  return Math.round(n * 100) / 100
+}
+
 
 console.log('\n' + (fail === 0 ? '✅ 全部通过' : '❌ 有失败') + '：' + pass + ' 项断言，' + fail + ' 项失败')
 if (fail) {

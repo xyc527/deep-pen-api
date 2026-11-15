@@ -15,7 +15,28 @@
 const state = {
   showBalance: true,
   settings: null,
-  settingsRev: 0
+  settingsRev: 0,
+  // 会话记录被整包换掉（导入存档）时用：设置没变，但首页手上的对话列表已经过期了
+  chatsRev: 0,
+  // 记忆被清空 / 重写：首页手上那份 memNotes 会过期，不清掉的话下次发消息
+  // 又会把旧记忆折回去 —— 用户刚点完「清空」，记忆却自己长回来。
+  memoryRev: 0,
+  // 首页正在收回答。切人设 / 切模式会换掉整套档案，边收边换会让这一轮的分片
+  // 写进另一个人的对话里，所以设置页切换前先看这一位。
+  chatBusy: false
+}
+
+// 设置分类页的"要打开哪一页"：页面之间没有 props，navTo 的 options
+// 在 Vue 页面（不是原生 page.js）里拿不到，所以用模块单例传参。
+// 只是一个字符串，写在 navTo 之前，目标页 mounted 时读一次即可。
+let _section = ''
+
+export function setSection(id) {
+  _section = String(id || '')
+}
+
+export function getSection() {
+  return _section
 }
 
 const subs = []
@@ -52,6 +73,20 @@ export function publishSettings(settings) {
   state.settings = settings
   state.settingsRev = state.settingsRev + 1
   state.showBalance = settings.showBalance !== false
+  notify()
+  return state
+}
+
+// 广播"对话记录变了"（导入存档之后）。不带上设置 —— 设置那一份有自己的通道
+export function publishChats() {
+  state.chatsRev = state.chatsRev + 1
+  notify()
+  return state
+}
+
+// 广播"记忆变了"（设置页清空记忆之后）。首页据此重读磁盘，避免旧记忆被折回去
+export function publishMemory() {
+  state.memoryRev = state.memoryRev + 1
   notify()
   return state
 }

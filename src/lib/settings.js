@@ -1,8 +1,9 @@
 // 设置模型（纯函数）：默认值、归一化、迁移
 
 import { defaultParams, PARAM_MAP, clampNumber } from './params.js'
+import { normalizeMemory, MEMORY_DEFAULT } from './memory.js'
 
-export const SETTINGS_VERSION = 1
+export const SETTINGS_VERSION = 2
 
 export const DEFAULT_BASE_URL = 'https://api.deepseek.com/v1'
 
@@ -23,6 +24,9 @@ export const DEFAULT_SETTINGS = {
   // 保存方式：'auto' 改一项存一项；'manual' 只在点顶部「保存」时落盘。
   // 两者互斥 —— manual 下所有改动只留在内存，顶部才会出现保存按钮
   saveMode: 'auto',
+  // 上下文压缩与记忆：超出历史窗口的对话折成"摘要记忆"继续带上，默认开。
+  // 每个模式/人设各有一份自己的记忆，互不影响
+  memory: normalizeMemory(MEMORY_DEFAULT),
   params: defaultParams(),
   updatedAt: 0
 }
@@ -60,6 +64,7 @@ export function normalizeSettings(raw) {
     saveMode: src.saveMode === 'manual' ? 'manual' : 'auto',
     // 只认 'full'，其它一律单行（老配置没有这个字段 → 单行）
     sourceStyle: src.sourceStyle === 'full' ? 'full' : 'single',
+    memory: normalizeMemory(src.memory),
     params: Object.assign({}, defaultParams(), src.params && typeof src.params === 'object' ? src.params : {}),
     updatedAt: Number(src.updatedAt) || 0
   }
@@ -72,7 +77,14 @@ export function normalizeSettings(raw) {
     if (def.kind === 'number') out.params[keys[i]] = clampNumber(def, v)
     else if (def.kind === 'bool') out.params[keys[i]] = v === true || v === 'true'
     else if (def.kind === 'enum') {
-      const ok = def.options.some((o) => o.value === v)
+      let ok = def.options.some((o) => o.value === v)
+      // model 是动态字段：除内置清单外，还要接受 /models 扫到的第三方供应商 id。
+      // 否则用户切到 gpt-4o / qwen-max 之类模型后，saveSettings → writeProfile →
+      // normalizeSettings 会把这 id 当成"非法枚举值"打回默认 deepseek-flash，
+      // 表现为"切了模型保存后又被弹回去、无法切换"。
+      if (!ok && keys[i] === 'model') {
+        ok = out.models.some((m) => m && m.id === v)
+      }
       out.params[keys[i]] = ok ? v : def.default
     } else out.params[keys[i]] = String(v == null ? def.default : v)
   }

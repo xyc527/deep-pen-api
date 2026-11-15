@@ -4,14 +4,19 @@
         <!-- 顶栏：标题 + 参数状态 + 入口。高度固定，滚动区拿剩下的高度 -->
         <div class="ix-top">
             <text class="ix-title" @click="openDrawer">{{ title }}</text>
+            <!-- 人设切换**只在设置页**给（人设与角色 → 切换人设）。
+                 主界面不摆这个入口：陪伴模式下换人设是低频动作，顶栏留给
+                 模型 / 余额 / 思考 / 联网这些真正随手要动的开关。 -->
             <div class="ix-chip" @click="openSettings"><text class="ix-chiptxt">{{ modelShort }}</text></div>
             <!-- 余额 + 当前计费时段：点一下立刻查一次余额（后台每 5 分钟自动刷）。
                  可在设置页「账户 → 主页显示」关掉，关掉后连轮询一起停 -->
             <div v-if="showBal" :class="balChipClass" @click="refreshBalance(true)"><text :class="balTxtClass">{{ balLabel }}</text></div>
             <div :class="thinkChipClass" @click="toggleThink"><text :class="thinkTxtClass">{{ thinkLabel }}</text></div>
             <div :class="searchChipClass" @click="toggleSearch"><text :class="searchTxtClass">{{ searchLabel }}</text></div>
-            <div class="ix-chip" @click="newChat"><text class="ix-chiptxt">新对话</text></div>
-            <div class="ix-chip" @click="openDrawer"><text class="ix-chiptxt">历史</text></div>
+            <!-- 会话切换只在聊天模式给：扮演模式下聊天记录跟着人设走，一条线到底，
+                 再摆「新对话 / 历史」不仅多余，还容易在换档案后误开一条空白对话 -->
+            <div v-if="!isRole" class="ix-chip" @click="newChat"><text class="ix-chiptxt">新对话</text></div>
+            <div v-if="!isRole" class="ix-chip" @click="openDrawer"><text class="ix-chiptxt">历史</text></div>
         </div>
 
         <!-- 消息区：scroller 不能套 v-if（被 v-if 包裹会渲染空白） -->
@@ -19,9 +24,25 @@
             <div v-for="(m, mi) in messages" :key="m.id" class="ix-msg" :style="msgStyle(m)">
                 <div class="ix-msghead">
                     <text :class="roleClass(m)">{{ roleLabel(m) }}</text>
-                    <div v-if="m.role === 'assistant' && !m.pending" class="ix-meta" @click="toggleReason(m)"><text class="ix-metatxt">{{ reasonToggle(m) }}</text></div>
+                    <!-- 没有思考内容就不给这个开关：以前只判 assistant，导致
+                         开场白（以及关掉思考后的回答）都顶着一个点开是空的「思考过程」 -->
+                    <div v-if="m.role === 'assistant' && !m.pending && m.reasoning" class="ix-meta" @click="toggleReason(m)"><text class="ix-metatxt">{{ reasonToggle(m) }}</text></div>
                 </div>
 
+
+                <!-- 查高德地图中的状态：跟联网检索一样要提示，不然这几秒屏幕上没动静 -->
+                <div v-if="m.mapping" class="ix-searching">
+                    <text class="ix-searchingtxt">正在查高德地图…</text>
+                </div>
+
+                <!-- 查到了什么：一行标签，点开看真实数据。摆出来是为了让用户能核实
+                     「模型说的天气到底是不是高德给的」，而不是信它一张嘴 -->
+                <div v-if="m.mapChip" class="ix-srcs" @click="toggleMap(m)">
+                    <text class="ix-maptxt">{{ m.mapChip }}{{ mapOpen(m) ? ' ▲' : ' ▼' }}</text>
+                </div>
+                <div v-if="m.mapChip && mapOpen(m)" class="ix-srclist">
+                    <text v-for="(ln, li) in mapLines(m)" :key="li" class="ix-srcitem">{{ ln }}</text>
+                </div>
 
                 <!-- 联网检索中的状态。搜索是同步请求，1–3 秒才有结果，
                      不给提示的话屏幕上毫无变化，看着像卡死 -->
@@ -104,15 +125,6 @@
             <div ref="bottom" class="ix-anchor"></div>
         </scroller>
 
-        <!-- 选中操作条：**固定**在输入条上方，不跟着消息滚。
-             先做成消息内联的，长回答滚到底部后操作条留在屏幕外，点不到（实测）。 -->
-        <div v-if="selId" class="ix-actbar">
-            <text class="ix-acthint">{{ selHint }}</text>
-            <div class="ix-act" @click="regenSel"><text class="ix-acttxt">重新生成</text></div>
-            <div class="ix-act" @click="editSel"><text class="ix-acttxt">修改内容</text></div>
-            <div class="ix-act-c" @click="clearSel"><text class="ix-acttxt">取消</text></div>
-        </div>
-
         <!-- 输入条 -->
         <div class="ix-input">
             <div :class="imgBtnClass" @click="openPicker"><text :class="imgBtnTxtClass">{{ imgLabel }}</text></div>
@@ -122,6 +134,19 @@
             </div>
             <div v-if="!busy" class="ix-sendbtn" @click="send"><text class="ix-sendtxt">发送</text></div>
             <div v-else class="ix-stopbtn" @click="stop"><text class="ix-stoptxt">停止</text></div>
+        </div>
+
+        <!-- 选中操作条：浮在对话区底部，不跟着消息滚（做成内联的话长回答滚到底部就点不到了）。
+             必须放在输入条**之后**：本平台里 position:absolute 的元素按兄弟顺序叠，
+             写在输入条前面时触摸会落到下层的消息正文上 —— 点了没反应（实测）。 -->
+        <div v-if="selId" class="ix-actbar">
+            <text class="ix-acthint">{{ selHint }}</text>
+            <!-- 按钮按角色给：自己的提问只能改、不能重抽（重抽的是回答），
+                 回答只能重抽、不能改（要改就自己另说一句），两种模式都一样。
+                 开场白除外：它前面没有提问，重抽一定失败，干脆不给按钮 -->
+            <div v-if="selIsAnswer && selMsg && !selMsg.greet" class="ix-act" @click="regenSel"><text class="ix-acttxt">重新生成</text></div>
+            <div v-if="selIsUser" class="ix-act" @click="editSel"><text class="ix-acttxt">修改内容</text></div>
+            <div class="ix-act-c" @click="clearSel"><text class="ix-acttxt">取消</text></div>
         </div>
 
         <!-- 图片选择层 -->
@@ -177,11 +202,13 @@
                 </div>
             </div>
         </div>
+        <!-- 人设切换层已经搬到设置页（人设与角色 → 切换人设）：
+             主界面留一个能一键换掉整套档案的入口，误触代价太大 -->
     </div>
 </template>
 
 <script>
-import { loadSettings, saveSettings, getLastSaveInfo, loadChats, saveChats, loadPhotoSeen, savePhotoSeen, loadBalance, saveBalance } from '../../services/store.js'
+import { loadSettings, saveSettings, getLastSaveInfo, loadChats, saveChats, loadPhotoSeen, savePhotoSeen, loadBalance, saveBalance, loadMemoryState, saveMemory } from '../../services/store.js'
 import { sendChat, sendOnce, fetchBalance, searchWeb } from '../../services/api.js'
 import { restoreHoliday, ensureHoliday } from '../../services/holiday.js'
 import { openTextEditor } from '../../services/ime.js'
@@ -197,6 +224,10 @@ import { billingPeriod, setTimeSkew, nowMs } from '../../lib/peak.js'
 import { balanceChipText, balanceLevel } from '../../lib/balance.js'
 import { setUiState, subscribeUiState, getUiState } from '../../lib/uistate.js'
 import { normalizeSearchMode, shouldSearch, buildSearchQuery, formatSearchContext, searchSources, injectSearchContext, sourceLine } from '../../lib/search.js'
+import { personaSystemPrompt, greetingOf } from '../../lib/persona.js'
+import { planCompression, foldMessages, memoryText, notesAfter } from '../../lib/memory.js'
+import { parseMapIntent, formatMapContext, mapChipLabel } from '../../lib/mapintent.js'
+import { ensureAmap, runMapIntent, amapAutoOn } from '../../services/amap.js'
 
 const MAX_IMAGES = 4
 
@@ -205,6 +236,8 @@ const planCache = {}
 const reasonOpenSet = {}
 // 联网来源的展开状态（同样放模块作用域）
 const srcOpenSet = {}
+// 地图查询结果的展开状态
+const mapOpenSet = {}
 // 展开状态一律按消息 id 记账；调用方传消息对象或 id 都能拿到同一个 key。
 // （模板里 v-if 曾写成 srcOpen(m.id)，而方法取的是 m.id → undefined，恒为 false：
 //   标签能变 ▲，列表却永远不出现。）
@@ -259,7 +292,15 @@ export default {
             // settings 对象换引用触发，而设置页改的是它自己那份 settings。
             showBal: true,
             period: null,
-            periodTimer: null
+            periodTimer: null,
+            // 压缩记忆（按档案分，切人设就换一段）
+            memNotes: [],
+            // 清空记忆的时间水位：更早的消息不再折进来
+            memFloor: 0,
+            // 已经收到的"对话记录变更"版本号（导入存档后要重读）
+            chatsRev: 0,
+            // 已经收到的"记忆变更"版本号（设置页清空记忆后要重读）
+            memRev: 0
         }
     },
     computed: {
@@ -274,10 +315,20 @@ export default {
             const i = this.idxOf(this.selId)
             return i < 0 ? null : this.messages[i]
         },
+        // 选中的是回答 → 只给「重新生成」；选中的是我的提问 → 只给「修改内容」
+        selIsAnswer() {
+            const m = this.selMsg
+            return !!m && m.role === 'assistant'
+        },
+        selIsUser() {
+            const m = this.selMsg
+            return !!m && m.role === 'user'
+        },
         selHint() {
             // 注意：selMsg 是 computed（属性），不能写成 this.selMsg()
             const m = this.selMsg
             if (!m) return ''
+            if (m.greet) return '已选：开场白'
             return m.role === 'user' ? '已选：我的提问' : '已选：这条回答'
         },
         askTitle() {
@@ -292,7 +343,22 @@ export default {
             return '这句之后还有 ' + n + ' 条内容，' + what + '会把它们一起清空，且无法恢复。'
         },
         title() {
-            return this.conv ? this.conv.title : 'DeepSeek'
+            const c = this.conv
+            if (!c) return 'DeepSeek'
+            // 扮演模式没有「新对话」入口了，空会话再顶着「新对话」三个字，
+            // 看着像还能新建一条 —— 换成「与「人设」对话」，说清这是谁的线
+            if (this.isRole && c.title === '新对话') {
+                return '与「' + this.personaName + '」对话'
+            }
+            return c.title
+        },
+        // 扮演模式才有的概念（聊天模式没有人设）
+        isRole() {
+            return !!(this.settings && this.settings.mode === 'role')
+        },
+        personaName() {
+            const n = this.settings && this.settings.personaName
+            return n || '人设'
         },
         modelShort() {
             const id = this.settings ? this.settings.params.model : ''
@@ -384,10 +450,28 @@ export default {
                 // 直接拿来用会出现「改了芯片只写盘、界面不刷新」——本平台对
                 // 跨页面实例的深层改写派发不稳定（实测）。拷一层普通对象后，
                 // this.settings 的引用变化始终由本页自己控制。
+                const prevKey = this.profileTag()
                 this.settings = Object.assign({}, s.settings, {
-                    params: Object.assign({}, s.settings.params)
+                    params: Object.assign({}, s.settings.params),
+                    memory: Object.assign({}, s.settings.memory)
                 })
                 this.applyShowBalance(this.settings)
+                // 切了模式 / 人设：设置、会话记录、余额、记忆全是另一套，
+                // 不重读的话屏幕上还是上一个人的对话（发出去就串了）
+                if (prevKey !== this.profileTag()) this.switchProfileLocal()
+                return
+            }
+            // 导入存档：对话记录被整包换掉了，设置没变也必须重读一遍
+            if (s.chatsRev > this.chatsRev) {
+                this.chatsRev = s.chatsRev
+                this.reloadConvs()
+                return
+            }
+            // 设置页清空了记忆：本页手上的 memNotes 已经作废，不清掉的话
+            // 下一次发消息会把旧记忆折回去（用户会说"清空没用"）
+            if (s.memoryRev > this.memRev) {
+                this.memRev = s.memoryRev
+                this.reloadMemoryLocal()
                 return
             }
             if (this.showBal === s.showBalance) return
@@ -436,9 +520,78 @@ export default {
             await restoreHoliday()
             this.tickPeriod()
             this.startPeriodTimer()
+            // 压缩记忆按档案存，进页面先读一次（后面发请求要带上）
+            const ms = await loadMemoryState()
+            this.memNotes = ms.notes
+            this.memFloor = ms.floor
             await this.loadConvState()
             this.refreshBalance(false)
             this.syncHoliday(false)
+        },
+
+        // 只重读对话列表（导入存档后用）。不重置当前对话 —— 除非它已经不在了
+        async reloadConvs() {
+            const list = await loadChats()
+            if (!list.length) { this.flash('这个档案还没有对话'); return }
+            this.convs = list
+            let hit = false
+            for (let i = 0; i < list.length; i++) if (list[i].id === this.convId) hit = true
+            if (!hit) this.convId = list[0].id
+            this.selId = ''
+            this.ask = null
+            this.scrollToBottom(true)
+            this.flash('已载入 ' + list.length + ' 个对话')
+        },
+
+        // 重读压缩记忆（设置页清空 / 重写之后）。
+        // 为什么不自己判断有没有变：清空是别的页面干的，本页只知道"版本号跳了"。
+        async reloadMemoryLocal() {
+            const ms = await loadMemoryState()
+            this.memNotes = ms.notes
+            this.memFloor = ms.floor
+        },
+
+        // 当前档案指纹：'chat' 或 'role:<id>'。换人就整页换数据。
+        profileTag() {
+            const s = this.settings
+            if (!s) return ''
+            return (s.mode || 'chat') + ':' + (s.personaId || '')
+        },
+        // 扮演模式下"谁在回答"
+        botName() {
+            const s = this.settings
+            if (s && s.mode === 'role' && s.personaName) return s.personaName
+            return 'DeepSeek'
+        },
+
+        // 切模式 / 切人设之后：会话、记忆、余额全换一套。
+        // 这些数据在磁盘上是按档案分文件的（chats_role_x.json 之类），所以只要重读。
+        async switchProfileLocal() {
+            this.selId = ''
+            this.ask = null
+            this.status = ''
+            // 换档案一律回到对话界面：切到扮演模式后历史抽屉不再有入口，
+            // 若页面还停在抽屉上就退不出来了
+            this.view = 'chat'
+            const ms = await loadMemoryState()
+            this.memNotes = ms.notes
+            this.memFloor = ms.floor
+            this.bal = null
+            this.balErr = ''
+            this.balFetchedAt = 0
+            const cached = await loadBalance()
+            if (cached) {
+                this.bal = cached
+                this.balFetchedAt = cached.at
+                setTimeSkew(cached.skew)
+            }
+            this.convs = []
+            this.convId = ''
+            await this.loadConvState()
+            this.refreshBalance(true)
+            this.flash('已切换到' + (this.settings && this.settings.mode === 'role'
+                ? ('人设「' + this.settings.personaName + '」')
+                : '聊天模式'))
         },
 
         // 后台更新节假日表（一年才变一次，失败静默）
@@ -527,6 +680,26 @@ export default {
             }
         },
 
+        // 扮演模式的开场白：档案里还一条消息都没有时，让角色先开口。
+        // 只补"空对话"，绝不往已有记录里插 —— 换了人设再切回来也不会重复。
+        // 开场白是真实消息（会存盘、能选中、能重建标题），但发请求时由
+        // buildApiMessages 把它改写成 system 说明，避免 assistant 打头被模型拒。
+        seedGreeting() {
+            const s = this.settings
+            if (!s || s.mode !== 'role') return
+            const conv = this.conv
+            if (!conv) return
+            const text = greetingOf(s.personaCard)
+            if (!text) return
+            if (!conv.messages) conv.messages = []
+            if (conv.messages.length) return
+            const m = newMessage('assistant', text)
+            m.greet = true
+            conv.messages.push(m)
+            saveChats(this.convs)
+            log('greet seeded len=' + text.length)
+        },
+
         async loadConvState() {
             this.convs = await loadChats()
             if (!this.convs.length) {
@@ -534,6 +707,7 @@ export default {
                 this.convs = [c]
             }
             this.convId = this.convs[0].id
+            this.seedGreeting()
             await this.refreshPhotos()
             // 上一次的相册快照（落盘，跨页面重建/重启都还在）
             this.photoSeen = await loadPhotoSeen()
@@ -554,7 +728,11 @@ export default {
                 this.settingsRev = getUiState().settingsRev
                 return
             }
-            this.settings = Object.assign({}, s, { params: Object.assign({}, s.params) })
+            const prevKey = this.profileTag()
+            this.settings = Object.assign({}, s, {
+                params: Object.assign({}, s.params),
+                memory: Object.assign({}, s.memory)
+            })
             this.settingsRev = getUiState().settingsRev
             this.applyShowBalance(s)
             if (!isReady(s)) {
@@ -562,7 +740,11 @@ export default {
                 return
             }
             // 刚从 setup 回来：会话状态还没加载过
-            if (!this.convs.length) await this.loadConvState()
+            if (!this.convs.length) { await this.loadConvState(); return }
+            // 模式 / 人设换过（onShow 这条路径也要跟上，不能只靠广播）
+            if (prevKey && prevKey !== this.profileTag()) await this.switchProfileLocal()
+            // 同一档案从设置页返回：刚填了开场白、而对话还是空的，也补上
+            else this.seedGreeting()
         },
 
         // 回到前台时把"离开期间新增的照片"并入待发送列表。
@@ -693,7 +875,9 @@ export default {
             return c
         },
         newChat() {
-
+            // 扮演模式没有「新对话」入口（顶栏芯片已藏），这里再兜一层，
+            // 免得从别处误调到把当前人设的记录切走
+            if (this.isRole) return
             const c = newConversation()
             this.convs = [c].concat(this.convs)
             this.convId = c.id
@@ -705,6 +889,9 @@ export default {
             saveChats(this.convs)
         },
         openDrawer() {
+            // 扮演模式不提供会话切换：入口芯片已藏掉，标题这一处点击也要一起关，
+            // 否则顶栏左边点一下仍会弹出历史列表
+            if (this.isRole) return
             this.delId = ''
             this.view = 'drawer'
         },
@@ -727,6 +914,9 @@ export default {
             saveChats(this.convs)
         },
 
+        // ---------- 人设切换 ----------
+        // 入口只在设置页（人设与角色 → 切换人设）。这里保留 switchProfileLocal()：
+        // 设置页切完会广播 settings，本页收到 profileTag 变化就走整套档案重载。
         openSettings() {
             navTo('settings', {})
         },
@@ -850,24 +1040,92 @@ export default {
             bot.pending = true
             conv.messages.push(bot)
             this.busy = true
+            // 告诉设置页「首页正在收回答」：那边切人设会换掉整套档案，
+            // 这一轮的流式分片还在往旧对话里写
+            setUiState({ chatBusy: true })
             this.cancelled = false
             this.status = ''
             this.scrollToBottom()
 
             try {
                 const urlMap = await this.imageUrlMap(userMsg.images).catch(() => ({}))
+                // 系统提示词：扮演模式是"角色卡 + 补充要求"拼出来的，聊天模式就是那一条
+                const sysPrompt = settings.mode === 'role'
+                    ? personaSystemPrompt(settings.personaCard, settings.systemPrompt)
+                    : settings.systemPrompt
+
+                // 上下文压缩：窗口外的消息不是"丢掉"，而是先折成摘要记忆，
+                // 再作为一条 system 带上（记忆关掉时退回老行为：直接截断）
+                const memOn = !!(settings.memory && settings.memory.on)
+                const maxMsgs = settings.maxHistory * 2
+                const plan = planCompression(conv.messages, maxMsgs, memOn)
+                let memText = memoryText(this.memNotes)
+                if (memOn && plan.drop.length) {
+                    // 清空记忆时有 floor：比它更早的消息不再折回来，只攒清空之后的新对话
+                    const fresh = notesAfter(plan.drop, this.memFloor)
+                    const folded = foldMessages(this.memNotes, fresh, { lines: settings.memory.lines })
+                    if (folded.added > 0 || folded.dropped > 0) {
+                        this.memNotes = folded.notes
+                        saveMemory(folded.notes, this.memFloor)
+                        memText = memoryText(folded.notes)
+                        log('MEM fold +' + folded.added + ' total=' + folded.notes.length)
+                    }
+                }
+
                 const apiMsgs = buildApiMessages(conv.messages, {
-                    systemPrompt: settings.systemPrompt,
-                    maxMessages: settings.maxHistory * 2,
+                    systemPrompt: sysPrompt,
+                    memoryText: memOn ? memText : '',
+                    maxMessages: maxMsgs,
                     imageUrlOf: (path) => urlMap[path] || this.urlCache[path] || null
                 })
+
+                // ---- 高德地图：本地认意图 → 查 → 注入 ----
+                // 跟联网搜索同一套路子，但有两条硬约束：
+                //   1) 扮演模式一律不查（地图是聊天侧的能力，不该在角色对话里插一句"北京晴13度"）
+                //   2) 命中地图就不再联网搜索——两边都跑首包要等十几秒，屏幕上什么都不动
+                let mapCtx = ''
+                let mapUsed = false
+                if (settings.mode !== 'role') {
+                    try {
+                        if (await ensureAmap()) {
+                            const mi = parseMapIntent(text)
+                            // 设置里关掉「自动识别」后，只有明确说「使用高德地图」才查 ——
+                            // 关键词触发会消耗配额，必须留一个能彻底闭嘴的开关
+                            if (mi.kind !== 'none' && (mi.forced || amapAutoOn())) {
+                                bot.mapping = true
+                                this.status = '正在查高德地图…'
+                                try {
+                                    const mr = await runMapIntent(mi)
+                                    if (mr.ok) {
+                                        mapCtx = formatMapContext(mr.kind, mr.data)
+                                        bot.mapChip = mapChipLabel(mr.kind, mr.data)
+                                        bot.mapDetail = formatMapContext(mr.kind, mr.data, { brief: true })
+                                        mapUsed = !!mapCtx
+                                        log('MAP ' + mi.kind + ' ' + mi.query)
+                                    } else {
+                                        log('MAP ERR ' + mi.kind + ' ' + mr.error)
+                                        this.flash('地图查询没成功：' + mr.error)
+                                    }
+                                } finally {
+                                    bot.mapping = false
+                                    this.status = ''
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        // 地图整条链路任何异常都不能连累对话，降级成"不查"
+                        bot.mapping = false
+                        this.status = ''
+                        log('MAP THROW ' + ((e && e.message) || e))
+                    }
+                }
 
                 // ---- 联网搜索：先检索，再把资料注入上下文 ----
                 // 官方 /v1/tools/search 是纯检索接口，不会自己判断该不该搜，
                 // 所以「自动」档靠 lib/search.js 的本地规则判断（零请求、零延迟）。
                 const searchMode = normalizeSearchMode(settings.params.searchMode)
                 let searchCtx = ''
-                if (shouldSearch(text, searchMode)) {
+                if (!mapUsed && shouldSearch(text, searchMode)) {
                     const q = buildSearchQuery(text)
                     bot.searching = true
                     try {
@@ -892,7 +1150,9 @@ export default {
                     }
                 }
 
-                const built = buildBody(settings.params, injectSearchContext(apiMsgs, searchCtx))
+                // 地图数据和搜索资料都是"这一轮才有的外部事实"，插在最后一条 user 之前。
+                // 两者互斥（命中地图就不搜），所以取其一即可
+                const built = buildBody(settings.params, injectSearchContext(apiMsgs, mapCtx || searchCtx))
                 if (!built.ok) throw new Error(built.errors.join('；'))
                 if (built.warnings.length) this.flash(built.warnings[0])
                 log('REQ ' + describeBody(built.body))
@@ -933,6 +1193,7 @@ export default {
             } finally {
                 this.streamFlush(bot)
                 this.busy = false
+                setUiState({ chatBusy: false })
                 conv.updatedAt = Date.now()
                 saveChats(this.convs)
                 this.scrollToBottom()
@@ -961,6 +1222,8 @@ export default {
         editSel() { const m = this.selMsg; if (m) this.askEdit(m) },
         cancelAsk() { this.ask = null },
         askRegen(m) {
+            // 只有回答能重抽：提问本身是用户写的那一句，重抽没有意义
+            if (!m || m.role !== 'assistant') return
             if (this.busy) { this.flash('正在生成，先点「停止」'); return }
             const plan = planRegenerate(this.messages, m.id)
             if (!plan) { this.flash('这条消息前面没有提问，无法重抽'); return }
@@ -968,6 +1231,8 @@ export default {
             this.doRegen(m.id)
         },
         askEdit(m) {
+            // 只有自己的提问能改：回答是模型生成的，改内容等于伪造记录
+            if (!m || m.role !== 'user') return
             if (this.busy) { this.flash('正在生成，先点「停止」'); return }
             const plan = planEdit(this.messages, m.id)
             if (!plan) return
@@ -1152,7 +1417,9 @@ export default {
         },
         roleLabel(m) {
             if (m.role === 'user') return '我'
-            return m.pending ? 'DeepSeek · 生成中' : 'DeepSeek'
+            // 扮演模式下回答者的名字就是人设名，不然聊天记录里两个人全叫 DeepSeek
+            const who = this.botName()
+            return m.pending ? who + ' · 生成中' : who
         },
         roleClass(m) {
             return m.role === 'user' ? 'ix-roleuser' : 'ix-rolebot'
@@ -1183,6 +1450,21 @@ export default {
         toggleSources(m) {
             srcOpenSet[openKey(m)] = !this.srcOpen(m)
             this.$forceUpdate()
+        },
+        // 地图结果：同一套"默认收起、点开看数据"的交互
+        mapOpen(m) {
+            return mapOpenSet[openKey(m)] === true
+        },
+        toggleMap(m) {
+            mapOpenSet[openKey(m)] = !this.mapOpen(m)
+            this.$forceUpdate()
+        },
+        // 展开后按行渲染。整段塞进一个 <text> 的话换行靠框架自动折，
+        // 数据行里有缩进（POI 的地址行），自己按 \n 切开更整齐
+        mapLines(m) {
+            const t = String(m.mapDetail || '')
+            if (!t) return []
+            return t.split('\n').filter((x) => x !== '')
         },
         convRowStyle(c) {
             // 用内联 style 而不是"两个类各写一遍 background-color"：
@@ -1403,7 +1685,9 @@ export default {
 .ix-actbar {
     position: absolute;
     left: 12px;
-    top: 202px;
+    /* 输入条 56px 高、贴底 → 它的上沿在 224px。操作条 28px 高，放到 192 就整条落在
+       对话区里，不会压住输入条上沿（压住的那 6px 是点不到的） */
+    top: 192px;
     flex-direction: row;
     align-items: center;
     height: 28px;
@@ -1553,6 +1837,10 @@ export default {
     flex-direction: row;
     align-items: center;
     margin-top: 4px;
+}
+.ix-maptxt {
+    font-size: 11px;
+    color: #86efac;
 }
 .ix-srctxt {
     font-size: 11px;

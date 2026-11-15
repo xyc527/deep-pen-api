@@ -2,7 +2,7 @@
     <div class="su-page">
         <div class="su-head">
             <text class="su-logo">DeepSeek</text>
-            <text class="su-sub">首次使用需要填入 API Key（仅保存在本机）</text>
+            <text class="su-sub">{{ headHint }}</text>
         </div>
 
         <div class="su-body">
@@ -47,6 +47,15 @@ export default {
         }
     },
     computed: {
+        // 扮演模式下这个页面填的是**某个人设**的 Key，不是全局的：
+        // 不写清楚的话，用户会以为"我刚填过怎么又没了"（另一个人设当然没有）
+        headHint() {
+            const s = this.settings
+            if (s && s.mode === 'role') {
+                return '扮演 · ' + (s.personaName || '人设') + ' 需要自己的 API Key（仅保存在本机）'
+            }
+            return '首次使用需要填入 API Key（仅保存在本机）'
+        },
         keyText() {
             const k = this.settings ? this.settings.apiKey : ''
             return k ? maskKey(k) : '（未填写）'

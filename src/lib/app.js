@@ -23,6 +23,12 @@ export function createApp(options) {
       this._events = {}
     }
 
+    // 框架在 onLaunch 返回后才读 this.$app.viewPort 交给原生容器做等比缩放，
+    // 所以这里实现成方法、onLaunch 里调用即可。0 表示不缩放。
+    setViewPort(viewPort) {
+      this.viewPort = viewPort
+    }
+
     on(name, cb) {
       if (!this._events[name]) this._events[name] = []
       this._events[name].push(cb)
