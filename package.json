@@ -1,6 +1,6 @@
 {
   "name": "deep-pen-api",
-  "version": "0.2.31",
+  "version": "0.2.32",
   "private": true,
   "description": "DeepSeek 客户端（词典笔 / Falcon 小程序，纯 API 端点模式）",
   "appid": "8000000000182399",
@@ -14,6 +14,7 @@
   "scripts": {
     "build": "node scripts/build.js",
     "build:prod": "node scripts/build.js prod",
+    "build:sim": "node scripts/build.js sim",
     "bump": "node scripts/bump.js",
     "test": "node test/run.mjs"
   },

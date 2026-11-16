@@ -1,5 +1,5 @@
 <template>
-    <div class="st-page">
+    <div class="st-page" :style="pageStyle">
         <div class="st-top">
             <text class="st-title">设置</text>
             <text :class="topHintClass">{{ topHint }}</text>
@@ -73,6 +73,7 @@ import { describePeriod, setTimeSkew, nowMs, formatRemain } from '../../lib/peak
 import { moneyText } from '../../lib/balance.js'
 import { modelOptions, findModel } from '../../lib/params.js'
 import { baseData, baseComputed, baseMethods } from './core.js'
+import { getFit } from '../../lib/fit.js'
 
 // 外层芯片上放短名：「DeepSeek V4.1 Flash」这种全称会把整行挤爆。
 // 内置模型有 short，扫描出来的 id 去掉 deepseek- 前缀。
@@ -107,6 +108,11 @@ export default {
         })
     },
     computed: Object.assign({}, baseComputed, {
+        pageStyle() {
+            const f = getFit()
+            if (!f || !f.ok || !f.apply) return {}
+            return { height: f.stageH + 'px' }
+        },
         isRole() {
             return !!(this.settings && this.settings.mode === 'role')
         },

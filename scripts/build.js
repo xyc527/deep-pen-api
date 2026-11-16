@@ -25,6 +25,10 @@ function cli() {
 
 const arg = (process.argv[2] || '').toLowerCase()
 const isProd = arg === 'prod'
+// sim：桌面模拟器调试包。用 mock:true 让 aiot-vue-cli 的 pluginVirtual 把
+// `import fs` / `import global` 替换成 api-mock/ 里的空桩（模拟器没有这两个原生模块，
+// 直接 import 会整页白屏）。只用于 PC 模拟器看版面，不是真机包。
+const isSim = arg === 'sim'
 
 const APP_ROOT = path.resolve(__dirname, '..')
 
@@ -87,7 +91,8 @@ async function main() {
   fs.mkdirSync(falconDir, { recursive: true })
 
   console.log('[build] rollup 打包...')
-  await build({ minify: isProd, mock: false, env: [] })
+  // sim 调试包用 mock:true（换掉 fs/global 原生 import），其余（含 prod）都用 mock:false。
+  await build({ minify: isProd, mock: isSim, env: [] })
 
   // 图标：包根放 app_icon.png，manifest 会 walk 整个产物目录自动登记 cert
   const icon = path.resolve(__dirname, '..', 'app_icon.png')

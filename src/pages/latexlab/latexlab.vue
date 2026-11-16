@@ -1,5 +1,5 @@
 <template>
-    <div class="lb-page">
+    <div class="lb-page" :style="pageStyle">
         <div class="lb-top">
             <text class="lb-title">LaTeX 诊断 {{ page + 1 }}/{{ pages }}</text>
             <div class="lb-chip" @click="prev"><text class="lb-chiptxt">上一页</text></div>
@@ -18,6 +18,7 @@
 
 <script>
 import { latexToUnicode, isBalanced } from '../../lib/latex.js'
+import { getFit } from '../../lib/fit.js'
 
 // 诊断语料：覆盖模型实际会写出来的各类 LaTeX 构造。
 // 每页 6 条（3 列 × 2 行），目的是肉眼比对"原生排版"能否出图、
@@ -73,6 +74,11 @@ export default {
         return { page: 0, auto: true, timer: null }
     },
     computed: {
+        pageStyle() {
+            const f = getFit()
+            if (!f || !f.ok || !f.apply) return {}
+            return { height: f.stageH + 'px' }
+        },
         pages() {
             return Math.ceil(CORPUS.length / PER_PAGE) + 1
         },

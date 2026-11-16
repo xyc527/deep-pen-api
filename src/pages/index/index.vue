@@ -1,5 +1,5 @@
 <template>
-    <div class="ix-page">
+    <div class="ix-page" :style="pageStyle">
 
         <!-- 顶栏：标题 + 参数状态 + 入口。高度固定，滚动区拿剩下的高度 -->
         <div class="ix-top">
@@ -150,7 +150,7 @@
         </div>
 
         <!-- 图片选择层 -->
-        <div v-if="view === 'picker'" class="ix-overlay">
+        <div v-if="view === 'picker'" class="ix-overlay" :style="pageStyle">
             <div class="ix-panel">
                 <div class="ix-paneltop">
                     <text class="ix-paneltitle">选择图片（已选 {{ images.length }}/{{ maxImages }}）</text>
@@ -170,7 +170,7 @@
         </div>
 
         <!-- 会话抽屉 -->
-        <div v-if="view === 'drawer'" class="ix-overlay">
+        <div v-if="view === 'drawer'" class="ix-overlay" :style="pageStyle">
             <div class="ix-drawer">
                 <div class="ix-paneltop">
                     <text class="ix-paneltitle">历史对话（{{ convs.length }}）</text>
@@ -228,6 +228,7 @@ import { personaSystemPrompt, greetingOf } from '../../lib/persona.js'
 import { planCompression, foldMessages, memoryText, notesAfter } from '../../lib/memory.js'
 import { parseMapIntent, formatMapContext, mapChipLabel } from '../../lib/mapintent.js'
 import { ensureAmap, runMapIntent, amapAutoOn } from '../../services/amap.js'
+import { getFit } from '../../lib/fit.js'
 
 const MAX_IMAGES = 4
 
@@ -304,6 +305,14 @@ export default {
         }
     },
     computed: {
+        // 多分辨率（路线 A）：根容器高度按真实屏幕重算。936×280 上 stageH=280，
+        // 返回空对象 → 内联 style 不覆盖类名里的 280px，与原行为完全一致。
+        // 只在 apply（非基准机）时注入，避免给基准机多加一层无谓的内联样式。
+        pageStyle() {
+            const f = getFit()
+            if (!f || !f.ok || !f.apply) return {}
+            return { height: f.stageH + 'px' }
+        },
         conv() {
             for (let i = 0; i < this.convs.length; i++) if (this.convs[i].id === this.convId) return this.convs[i]
             return null

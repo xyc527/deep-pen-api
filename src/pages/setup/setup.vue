@@ -1,5 +1,5 @@
 <template>
-    <div class="su-page">
+    <div class="su-page" :style="pageStyle">
         <div class="su-head">
             <text class="su-logo">DeepSeek</text>
             <text class="su-sub">{{ headHint }}</text>
@@ -36,6 +36,7 @@ import { testConnection } from '../../services/api.js'
 import { navTo, log } from '../../services/platform.js'
 import { maskKey, normalizeBaseUrl, isReady, settingsSignature } from '../../lib/settings.js'
 import { publishSettings } from '../../lib/uistate.js'
+import { getFit } from '../../lib/fit.js'
 
 export default {
     name: 'setup',
@@ -47,6 +48,11 @@ export default {
         }
     },
     computed: {
+        pageStyle() {
+            const f = getFit()
+            if (!f || !f.ok || !f.apply) return {}
+            return { height: f.stageH + 'px' }
+        },
         // 扮演模式下这个页面填的是**某个人设**的 Key，不是全局的：
         // 不写清楚的话，用户会以为"我刚填过怎么又没了"（另一个人设当然没有）
         headHint() {

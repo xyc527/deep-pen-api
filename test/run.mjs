@@ -24,7 +24,7 @@ import { normalizeMemory, memoryEntry, foldMessages, pruneNotes, memoryText, mem
 import { buildSettingsDoc, buildRecordsDoc, parseSettingsArchive, parseRecordsArchive, detectKind, archiveSummary, profileFolder, stampText, buildPersonaCardDoc, buildPersonaSampleDoc, personaFileName, ROOT_DIR, EXPORT_DIR, IMPORT_DIR, PERSONA_DIR } from '../src/lib/archive.js'
 import { AMAP_BASE, AMAP_CODES, amapErrorText, amapReady, amapKeyOf, placeSearchUrl, placeAroundUrl, weatherUrl, geocodeUrl, regeoUrl, drivingUrl, parseAmap, poiList, weatherNow, weatherForecast, geocodeFirst, regeoText, routeBrief, fmtDistance, fmtDuration, poiSubtitle, weatherLine, weatherRows } from '../src/lib/amap.js'
 import { parseMapIntent, pickCity, pickRoute, pickPlace, formatMapContext, mapChipLabel } from '../src/lib/mapintent.js'
-import { plan, fitViewport, isSaneScreen, normalizeScreen, DESIGN_W, DESIGN_H } from '../src/lib/fit.js'
+import { plan, fitViewport, layout, getFit, setFit, isSaneScreen, normalizeScreen, DESIGN_W, DESIGN_H } from '../src/lib/fit.js'
 import { readFileSync } from 'fs'
 
 let pass = 0
@@ -1795,34 +1795,46 @@ amapSuite()
 
 mapIntentSuite()
 
-// ---------- 多分辨率自适应（fit） ----------
+// ---------- 多分辨率自适应（fit，路线 A：宽度铺满 + 纵向重排） ----------
 {
-  // 基准机：scale=1 → 不缩放，viewPort 保持设计宽，零变化
+  // 基准机：stageH=280 → 零变化，apply=false
   {
     const p = plan({ width: 936, height: 280 })
     eq(p.ok, true, 'fit 基准机 ok')
-    eq(p.apply, false, 'fit 基准机不缩放')
-    eq(p.viewPort, 936, 'fit 基准机 viewPort=936')
+    eq(p.apply, false, 'fit 基准机不注入 stageH')
+    eq(p.viewPort, 936, 'fit 基准机 viewPort=936（钉死宽度）')
     eq(p.scale, 1, 'fit 基准机 scale=1')
-    eq(p.contentW, 936, 'fit 基准机 contentW=936')
-    eq(p.contentH, 280, 'fit 基准机 contentH=280')
+    eq(p.stageH, 280, 'fit 基准机 stageH=280')
   }
 
-  // 更扁的机型 960×266（PStore 明确点名）：必须缩放，两个方向都装得下
+  // 更扁的机型 960×266（PStore 明确点名）：stageH 重算，铺满不裁切
   {
     const p = plan({ width: 960, height: 266 })
     eq(p.ok, true, 'fit 960×266 ok')
-    eq(p.apply, true, 'fit 960×266 要缩放')
-    ok(p.scale < 1, 'fit 960×266 scale<1 (' + p.scale + ')')
-    ok(p.contentW <= 960 + 1, 'fit 960×266 宽装得下 (' + p.contentW + ')')
-    ok(p.contentH <= 266 + 1, 'fit 960×266 高装得下 (' + p.contentH + ')')
+    eq(p.apply, true, 'fit 960×266 要注入 stageH')
+    eq(p.viewPort, 936, 'fit 960×266 viewPort 仍钉死 936（宽度铺满）')
+    // stageH = 936*266/960 = 259.35
+    ok(Math.abs(p.stageH - 259.35) < 0.1, 'fit 960×266 stageH≈259.35 (' + p.stageH + ')')
+    // 框架放大 k=960/936=1.026 后铺满屏高：stageH * scale ≈ H
+    ok(Math.abs(p.stageH * p.scale - 266) < 0.5, 'fit 960×266 stageH*scale≈屏高 (' + (p.stageH * p.scale) + ')')
+  }
+
+  // 更高的机型 900×300：stageH 变大，铺满不落底留白
+  {
+    const p = plan({ width: 900, height: 300 })
+    eq(p.ok, true, 'fit 900×300 ok')
+    eq(p.apply, true, 'fit 900×300 要注入 stageH')
+    // stageH = 936*300/900 = 312
+    ok(Math.abs(p.stageH - 312) < 0.1, 'fit 900×300 stageH≈312 (' + p.stageH + ')')
+    ok(Math.abs(p.stageH * p.scale - 300) < 0.5, 'fit 900×300 stageH*scale≈屏高 (' + (p.stageH * p.scale) + ')')
   }
 
   // 长边归一：宽高颠倒也能算对
   {
     const a = plan({ width: 280, height: 936 })
     const b = plan({ width: 936, height: 280 })
-    eq(a.viewPort, b.viewPort, 'fit 宽高颠倒结果一致')
+    eq(a.viewPort, b.viewPort, 'fit 宽高颠倒 viewPort 一致')
+    eq(a.stageH, b.stageH, 'fit 宽高颠倒 stageH 一致')
     eq(a.scale, b.scale, 'fit 宽高颠倒 scale 一致')
   }
 
@@ -1839,13 +1851,13 @@ mapIntentSuite()
     eq(isSaneScreen(100, 30), false, 'fit 过小脏值')
     eq(isSaneScreen(2000, 100), false, 'fit 比例过扁脏值 (>6.7)')
     eq(isSaneScreen(936, 280), true, 'fit 基准机合法')
-    eq(plan({ width: 0, height: 0 }).apply, false, 'fit 未知屏不缩放')
+    eq(plan({ width: 0, height: 0 }).ok, false, 'fit 未知屏 not-ok')
     eq(plan({}).ok, false, 'fit 空 env 返回 not-ok')
     eq(plan(null).ok, false, 'fit null env 返回 not-ok')
     eq(fitViewport(0, 0), null, 'fitViewport 脏值返回 null')
   }
 
-  // 机型矩阵：每一条都断言「缩放后两个方向都装得下 + 至少贴住一条边 + 内容宽=设计宽按 scale 缩出」
+  // 机型矩阵：每一条断言「stageH 重算后，框架放大 scale 倍正好铺满屏高（宽恒钉死 936）」
   {
     const matrix = [
       [936, 280], [960, 266], [1024, 300], [960, 280], [800, 280],
@@ -1855,19 +1867,34 @@ mapIntentSuite()
       const p = plan({ width: w, height: h })
       const label = 'fit 矩阵 ' + w + '×' + h
       eq(p.ok, true, label + ' ok')
-      // 断言用归一化后的真实宽高（p.w/p.h），不用原始输入：长边当宽后竖装横用也等价
       const W = p.w
       const H = p.h
-      // ① 两个方向都装得下设计稿
-      ok(p.contentW <= W + 1, label + ' 宽装得下 (cw=' + p.contentW + ')')
-      ok(p.contentH <= H + 1, label + ' 高装得下 (ch=' + p.contentH + ')')
-      // ② 至少贴住一条边（别白缩）：宽或高至少一个接近满
-      const gapW = W - p.contentW
-      const gapH = H - p.contentH
-      ok(gapW < 2 || gapH < 2, label + ' 至少贴住一条边 (gapW=' + r2(gapW) + ', gapH=' + r2(gapH) + ')')
-      // ③ contentW/scale ≈ 设计宽（证明 contentW 确实是 936 按 scale 等比缩出来的）
-      ok(Math.abs(p.contentW / p.scale - DESIGN_W) < 2, label + ' contentW/scale≈设计宽')
+      // ① viewPort 恒钉死设计宽（宽度交给框架铺满，无黑边）
+      eq(p.viewPort, DESIGN_W, label + ' viewPort=936')
+      // ② stageH 重算后，框架放大 scale 倍 ≈ 屏高（铺满，不裁切不留白）
+      ok(Math.abs(p.stageH * p.scale - H) < 0.5,
+        label + ' stageH*scale≈屏高 (' + r2(p.stageH * p.scale) + ' vs ' + H + ')')
+      // ③ stageH 应等于 936*H/W（公式自洽）
+      ok(Math.abs(p.stageH - (DESIGN_W * H) / W) < 0.1, label + ' stageH=936*H/W')
     }
+  }
+
+  // layout() 骨架 + 运行时单例
+  {
+    const p = plan({ width: 960, height: 266 })
+    const l = layout(p)
+    eq(l.rootW, 936, 'layout rootW=936')
+    eq(l.rootH, p.stageH, 'layout rootH=stageH')
+    ok(l.factor > 1, 'layout factor=scale>1 (' + l.factor + ')')
+
+    // setFit/getFit：默认基准机骨架，页面在 fit 未跑起来时读到零变化
+    const d = getFit()
+    eq(d.apply, false, 'getFit 默认 apply=false')
+    eq(d.stageH, 280, 'getFit 默认 stageH=280')
+    setFit(p)
+    eq(getFit().stageH, p.stageH, 'setFit 后 getFit 读到新 stageH')
+    setFit(null)
+    eq(getFit().stageH, p.stageH, 'setFit(null) 不清空已有 fit')
   }
 }
 

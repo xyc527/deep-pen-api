@@ -1,5 +1,5 @@
 <template>
-    <div class="sy-page">
+    <div class="sy-page" :style="pageStyle">
         <div class="sy-top">
             <div class="sy-back" @click="back"><text class="sy-backtxt">返回</text></div>
             <text class="sy-title">{{ sec.title }}</text>
@@ -332,7 +332,7 @@
         <!-- 选择层：先把 import 目录里的文件列出来，让用户自己点哪一个。
              以前是「扫到什么就自动导入什么」（只有一个文件时直接弹确认），
              放错文件时用户没有选择权，也看不到目录里到底有什么 -->
-        <div v-if="pickOpen" class="sy-overlay">
+        <div v-if="pickOpen" class="sy-overlay" :style="pageStyle">
             <div class="sy-pick">
                 <text class="sy-confirmtitle">选择要导入的文件</text>
                 <text class="sy-pickdir">{{ importPath }}</text>
@@ -350,7 +350,7 @@
         </div>
 
         <!-- 确认层：删除 / 导入 / 清空这类会丢数据的操作都要问一次 -->
-        <div v-if="ask" class="sy-overlay">
+        <div v-if="ask" class="sy-overlay" :style="pageStyle">
             <div class="sy-confirm">
                 <text class="sy-confirmtitle">{{ ask.title }}</text>
                 <text class="sy-confirmtext">{{ ask.text }}</text>
@@ -390,6 +390,7 @@ import { exportProfile, listExports, readExport, listImportFiles, readImportFile
 import { amapKey, setAmapKey, testAmapKey, weather, setAmapAuto, amapAutoOn } from '../../services/amap.js'
 import { weatherLine } from '../../lib/amap.js'
 import { baseData, baseComputed, baseMethods } from '../settings/core.js'
+import { getFit } from '../../lib/fit.js'
 
 const GROUP_TITLES = {
     core: '模型与思考',
@@ -458,6 +459,11 @@ export default {
         })
     },
     computed: Object.assign({}, baseComputed, {
+        pageStyle() {
+            const f = getFit()
+            if (!f || !f.ok || !f.apply) return {}
+            return { height: f.stageH + 'px' }
+        },
         isRole() {
             return !!(this.settings && this.settings.mode === 'role')
         },
