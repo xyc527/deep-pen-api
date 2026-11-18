@@ -116,6 +116,8 @@
                         </div>
                     </div>
                     <text v-if="m.pending && !m.content" :class="cls('ix-typing', m)">正在思考…</text>
+                    <!-- 网络中断但已有半段内容：把原因追加在正文末尾，别让红字 error 把内容盖掉 -->
+                    <text v-if="m.interrupted && !m.error" class="ix-interrupted" @click="selectMsg(m)">〔{{ m.interrupted }}，已保留部分内容〕</text>
                 </div>
             </div>
 
@@ -1166,6 +1168,8 @@ export default {
                 if (built.warnings.length) this.flash(built.warnings[0])
                 log('REQ ' + describeBody(built.body))
 
+                // 难题思考时长无上限，不做静默/分档计时 —— 网络真断由 curl 自己退出触发，
+                // 这里只靠 api.js 里那个「僵尸兜底」大死线防极端情况。所以 opts 不再传超时。
                 const opts = {
                     baseUrl: settings.baseUrl,
                     apiKey: settings.apiKey,
@@ -1190,14 +1194,27 @@ export default {
                 bot.reasoning = r.reasoning
                 bot.pending = false
                 if (r.finishReason === 'length') this.flash('输出被 max_tokens 截断')
+                // 思考/正文流到一半断了（curl 退出但没收到 [DONE]）：内容已保留，
+                // 用 interrupted 在正文末尾标注，别让用户以为这是完整回答。
+                if (r.finishReason === 'incomplete') bot.interrupted = '网络中断，回复未完整'
                 if (r.usage) this.status = summarizeUsage(r.usage)
             } catch (e) {
                 bot.pending = false
+                // 先补上节流缓冲里还留着的内容（中断前已流出的部分不能丢）
+                this.streamFlush(bot)
                 if (e && e.code === 'CANCELLED') {
                     if (!bot.content) bot.content = '（已停止）'
                 } else {
-                    bot.error = (e && e.message) || '请求失败'
-                    log('ERR ' + bot.error)
+                    const msg = (e && e.message) || '请求失败'
+                    log('ERR ' + msg)
+                    // 中断时若已有内容（思考/正文流出过半），把错误「追加」到末尾保留半段，
+                    // 而不是用 bot.error 整条盖掉 —— 否则已生成的内容全没了。
+                    // 只有一点都没收到时，才走 bot.error（模板里 error 会独占一行，不渲染正文）。
+                    if (bot.content || bot.reasoning) {
+                        bot.interrupted = msg
+                    } else {
+                        bot.error = msg
+                    }
                 }
             } finally {
                 this.streamFlush(bot)
@@ -1289,6 +1306,7 @@ export default {
             if (!m) return
             m.content = String(text == null ? '' : text)
             m.error = ''
+            m.interrupted = ''
             // 渲染计划按 (id, 长度, pending) 缓存，同长度改写会命中旧结果 → 必须清
             delete planCache[m.id]
             this.selId = ''
@@ -2094,6 +2112,12 @@ export default {
     background-color: #2a1a1c;
     padding: 6px;
     border-radius: 4px;
+}
+
+.ix-interrupted {
+    font-size: 12px;
+    color: #d9a86c;
+    padding-top: 4px;
 }
 
 .ix-typing {

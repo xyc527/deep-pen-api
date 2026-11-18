@@ -27,10 +27,11 @@ const POLL_MS = 120
 const TMP_KEEP = false
 // 连接阶段上限：断网/域名解析不了时必须在几秒内失败，绝不能拖到整体超时
 const CONNECT_TIMEOUT_S = 8
-// 整体上限（秒）
-const DEFAULT_TIMEOUT_MS = 120000
-// 首包/中途静默上限：超过这么久一个新字节都没有，判网络假死并杀掉 curl
-const IDLE_TIMEOUT_MS = 45000
+// 整体兜底上限（秒）：难题思考可能很久，所以这个值只防「连接活着却不产数据也不退出」
+// 的 curl 僵尸态，阈值远大于任何合理思考时长。真正的「网络断了」由 curl 自己退出
+// （写 flagFile + errFile）触发，客户端据此报「网络中断」，不靠计时判死。
+// 注意：--max-time 用的就是这个值，改这里等于同时改 curl 的强制退出时间。
+const DEFAULT_TIMEOUT_MS = 600000
 
 function tmpDir() {
   return ensureAppDir('tmp')
@@ -382,15 +383,13 @@ export async function sendChat(opts) {
 
   try {
     const start = Date.now()
-    let lastDataAt = start
     for (;;) {
       if (opts.shouldCancel && opts.shouldCancel()) {
         cancelFiles(files)
         throw apiErr('CANCELLED', '已停止')
       }
       await sleep(POLL_MS)
-      const got = await drain()
-      if (got > 0) lastDataAt = Date.now()
+      await drain()
       if (upstreamError) break
       if (done) break
       if (await exists(files.flagFile)) {
@@ -398,14 +397,13 @@ export async function sendChat(opts) {
         break
       }
       const now = Date.now()
+      // 整体死线（兜底 curl 僵尸态）：难题思考可能很久，这里只防「连接活着却
+      // 既不产数据也不退出」的极端情况，阈值要远大于任何合理思考时长。
+      // 「网络真断了」由 curl 自己退出并写 flagFile，下面走「空内容 + errFile」报网络中断，
+      // 不靠这里的计时 —— 所以思考再久也不会被静默超时误杀。
       if (now - start > timeoutMs) {
         cancelFiles(files)
         throw apiErr('TIMEOUT', '请求超时（' + Math.round(timeoutMs / 1000) + 's）')
-      }
-      // 静默超时：连上了但迟迟没有数据（弱网、DNS 黑洞、代理断了）
-      if (!content && !reasoning && now - lastDataAt > IDLE_TIMEOUT_MS) {
-        cancelFiles(files)
-        throw apiErr('NETWORK', '网络无响应（' + Math.round(IDLE_TIMEOUT_MS / 1000) + 's 未收到任何数据）')
       }
     }
 

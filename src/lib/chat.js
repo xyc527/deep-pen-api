@@ -24,6 +24,7 @@ export function newMessage(role, text) {
     reasoning: '',
     images: [],
     error: '',
+    interrupted: '',
     pending: false,
     createdAt: Date.now()
   }
